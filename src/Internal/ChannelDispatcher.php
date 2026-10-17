@@ -5,6 +5,7 @@ namespace EasySwoole\AMQP\Internal;
 
 use EasySwoole\AMQP\Connection;
 use EasySwoole\AMQP\Exception\ProtocolException;
+use EasySwoole\AMQP\Exception\PublisherNackException;
 use EasySwoole\AMQP\Message;
 use EasySwoole\AMQP\Protocol;
 use EasySwoole\AMQP\PublisherConfirmResult;
@@ -31,6 +32,7 @@ final class ChannelDispatcher
     /** @return array{int, int, Reader} */
     public function readMethod(bool $closeOnTimeout = true, bool $bufferDeliveries = true, bool $returnCancellation = false): array
     {
+        $deferredNack = null;
         while (true) {
             [$class, $method, $reader] = $this->connection->readMethod($this->channelId, $closeOnTimeout);
             if ($this->handleServerFlow($class, $method, $reader)) continue;
@@ -40,7 +42,7 @@ final class ChannelDispatcher
             }
             if ($this->confirms->enabled() && $class === Protocol::BASIC && in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
                 $this->applyConfirmation($reader);
-                if ($method === Protocol::BASIC_NACK) throw new ProtocolException('RabbitMQ negatively acknowledged a published message.');
+                if ($method === Protocol::BASIC_NACK) $deferredNack = new PublisherNackException('RabbitMQ negatively acknowledged a published message.');
                 continue;
             }
             if ($bufferDeliveries && $class === Protocol::BASIC && $method === Protocol::BASIC_DELIVER) {
@@ -61,6 +63,7 @@ final class ChannelDispatcher
                 $this->consumerEvents[] = ['type'=>'cancel', 'value'=>$consumerTag];
                 continue;
             }
+            if ($deferredNack !== null) throw $deferredNack;
             return [$class, $method, $reader];
         }
     }
@@ -98,7 +101,7 @@ final class ChannelDispatcher
                 $this->protocolFailure("Expected publisher confirmation, received {$class}.{$method}.");
             }
             $this->applyConfirmation($reader);
-            if ($method === Protocol::BASIC_NACK) throw new ProtocolException('RabbitMQ negatively acknowledged a published message.');
+            if ($method === Protocol::BASIC_NACK) throw new PublisherNackException('RabbitMQ negatively acknowledged a published message.');
         }
         return $returned;
     }
@@ -117,7 +120,7 @@ final class ChannelDispatcher
             }
             if ($this->confirms->enabled() && $class === Protocol::BASIC && in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
                 $this->applyConfirmation($reader);
-                if ($method === Protocol::BASIC_NACK) throw new ProtocolException('RabbitMQ negatively acknowledged a published message.');
+                if ($method === Protocol::BASIC_NACK) throw new PublisherNackException('RabbitMQ negatively acknowledged a published message.');
                 continue;
             }
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_DELIVER) {

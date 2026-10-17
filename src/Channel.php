@@ -5,6 +5,7 @@ namespace EasySwoole\AMQP;
 
 use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Exception\ProtocolException;
+use EasySwoole\AMQP\Exception\PublisherNackException;
 use EasySwoole\AMQP\Exception\TimeoutException;
 use EasySwoole\AMQP\Internal\ChannelDispatcher;
 use EasySwoole\AMQP\Internal\ContentReader;
@@ -449,7 +450,10 @@ final class Channel
             $this->busy = true;
             try { return $callback(); }
             catch (ProtocolException $error) {
-                if ($error->replyCode !== 0 || !$this->connection->isConnected()) {
+                if (!($error instanceof PublisherNackException) && $error->replyCode === 0 && $this->connection->isConnected()) {
+                    $this->connection->abort();
+                }
+                if (!($error instanceof PublisherNackException)) {
                     $this->open = false; $this->connection->releaseChannel($this->id, $this);
                 }
                 throw $error;

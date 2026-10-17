@@ -281,14 +281,29 @@ final class ClientTest extends TestCase
     }
     public function testPublisherNackIsReported(): void
     {
+        $declared = (new Writer())->shortstr('still-open')->long(0)->long(0)->bytes();
         $incoming = ServerFrames::handshake()
             . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
             . ServerFrames::method(1, 85, 11)
-            . ServerFrames::method(1, 60, 120, (new Writer())->longlong(1)->bit(false)->bit(false)->bytes());
-        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
-        $this->expectException(ProtocolException::class);
-        $this->expectExceptionMessage('negatively acknowledged');
-        $channel->publishConfirmed('body');
+            . ServerFrames::method(1, 60, 120, (new Writer())->longlong(1)->bit(false)->bit(false)->bytes())
+            . ServerFrames::method(1, 50, 11, $declared);
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        try { $channel->publishConfirmed('body'); self::fail('Expected publisher NACK.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('negatively acknowledged', $error->getMessage()); }
+        self::assertTrue($client->isConnected());
+        self::assertSame('still-open', $channel->queueDeclare('still-open')['queue']);
+    }
+    public function testMalformedMethodPayloadAbortsConnection(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 71, '');
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        try { $channel->get('jobs'); self::fail('Expected truncated method payload.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('Truncated', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
     }
     public function testMandatoryConfirmedPublishReportsReturnedMessageAfterAck(): void
     {
@@ -419,6 +434,25 @@ final class ClientTest extends TestCase
         $channel->enablePublisherConfirms();
         $channel->publish('one');
         self::assertSame('jobs', $channel->queueDeclare('jobs')['queue']);
+    }
+    public function testRpcConsumesItsResponseBeforeReportingInterleavedPublisherNack(): void
+    {
+        $first = (new Writer())->shortstr('first')->long(0)->long(0)->bytes();
+        $second = (new Writer())->shortstr('second')->long(0)->long(0)->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 120, (new Writer())->longlong(1)->bit(false)->bit(false)->bytes())
+            . ServerFrames::method(1, 50, 11, $first)
+            . ServerFrames::method(1, 50, 11, $second);
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        $channel->enablePublisherConfirms();
+        $channel->publish('plain');
+        try { $channel->queueDeclare('first'); self::fail('Expected interleaved publisher NACK.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('negatively acknowledged', $error->getMessage()); }
+        self::assertTrue($client->isConnected());
+        self::assertSame('second', $channel->queueDeclare('second')['queue']);
     }
     public function testUnknownPublisherConfirmationTagAbortsConnection(): void
     {

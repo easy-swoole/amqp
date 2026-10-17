@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 namespace EasySwoole\AMQP\Exception;
 
-final class ProtocolException extends AMQPException
+class ProtocolException extends AMQPException
 {
     public function __construct(string $message, public readonly int $replyCode = 0, public readonly int $classId = 0, public readonly int $methodId = 0)
     {
