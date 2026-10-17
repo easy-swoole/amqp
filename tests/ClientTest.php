@@ -34,6 +34,88 @@ final class ClientTest extends TestCase
         $methods = self::writtenFrames($transport->written);
         self::assertSame([[10,11],[10,31],[10,40],[20,10],[50,10]], array_map(fn (Frame $f) => array_slice($f->methodParts(), 0, 2), $methods));
     }
+    public function testExternalAuthenticationUsesEmptySaslResponse(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake(mechanisms: 'PLAIN EXTERNAL'));
+        $client = new AMQP(new Config(
+            tls: new \EasySwoole\AMQP\TlsConfig(clientCertificate: '/cert/client.pem', clientPrivateKey: '/cert/key.pem'),
+            authMechanism: Config::AUTH_EXTERNAL,
+        ), $transport);
+        $client->connect();
+        $startOk = self::writtenFrames($transport->written)[0];
+        [, , $reader] = $startOk->methodParts();
+        $reader->table();
+        self::assertSame('EXTERNAL', $reader->shortstr());
+        self::assertSame('', $reader->longstr());
+        self::assertTrue($client->isConnected());
+    }
+    public function testUnsupportedConfiguredAuthenticationMechanismAbortsHandshake(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake(mechanisms: 'PLAIN'));
+        $client = new AMQP(new Config(
+            tls: new \EasySwoole\AMQP\TlsConfig(clientCertificate: '/cert/client.pem', clientPrivateKey: '/cert/key.pem'),
+            authMechanism: Config::AUTH_EXTERNAL,
+        ), $transport);
+        try { $client->connect(); self::fail('Expected unsupported authentication mechanism.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('EXTERNAL', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
+    }
+    public function testChannelFlowRequestAndServerFlowNotification(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 20, 21, (new Writer())->bit(false)->bytes())
+            . ServerFrames::method(1, 20, 20, (new Writer())->bit(false)->bytes())
+            . ServerFrames::method(1, 50, 11, (new Writer())->shortstr('jobs')->long(0)->long(0)->bytes());
+        $transport = new MemoryTransport($incoming);
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        self::assertFalse($channel->flow(false));
+        self::assertSame('jobs', $channel->queueDeclare('jobs')['queue']);
+        self::assertFalse($channel->isPublishingActive());
+        try { $channel->publish('paused'); self::fail('Expected publishing pause.'); }
+        catch (\LogicException $error) { self::assertStringContainsString('channel.flow', $error->getMessage()); }
+        $flowMethods = array_filter(self::writtenFrames($transport->written), static function (Frame $frame): bool {
+            return $frame->type === Frame::METHOD && array_slice($frame->methodParts(), 0, 2) === [20, 21];
+        });
+        self::assertCount(1, $flowMethods);
+    }
+    public function testTransactionsSelectCommitAndRollback(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 90, 11)
+            . ServerFrames::method(1, 90, 21)
+            . ServerFrames::method(1, 90, 31);
+        $transport = new MemoryTransport($incoming);
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        $channel->txSelect();
+        $channel->txSelect(); // idempotent; must not issue a second tx.select
+        $channel->publish('transactional');
+        $channel->txCommit();
+        $channel->txRollback();
+        $txMethods = array_values(array_filter(array_map(
+            static fn (Frame $frame): ?array => $frame->type === Frame::METHOD ? array_slice($frame->methodParts(), 0, 2) : null,
+            self::writtenFrames($transport->written),
+        ), static fn (?array $method): bool => $method !== null && $method[0] === 90));
+        self::assertSame([[90,10],[90,20],[90,30]], $txMethods);
+    }
+    public function testTransactionsAndPublisherConfirmsAreMutuallyExclusive(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 90, 11);
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $channel->txSelect();
+        $this->expectException(\LogicException::class);
+        $channel->enablePublisherConfirms();
+    }
+    public function testTransactionCommitRequiresTransactionMode(): void
+    {
+        $channel = (new AMQP(new Config(), new MemoryTransport(ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()))))->channel();
+        $this->expectException(\LogicException::class);
+        $channel->txCommit();
+    }
     public function testAdditionalExchangeQueueAndRecoverMethods(): void
     {
         $incoming = ServerFrames::handshake()

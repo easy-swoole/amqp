@@ -83,6 +83,8 @@ $channel->wait();
 
 协议操作还包括 `exchangeBind()`、`exchangeUnbind()`、`queueUnbind()`、`queuePurge()`、`recover()` 和 `recoverAsync()`。Field table 支持 Decimal、时间戳、二进制值和显式整数位宽，分别使用 `Wire\Decimal`、`DateTimeInterface`、`Wire\ByteArray` 和 `Wire\IntegerValue` 表示。
 
+Channel flow control 可通过 `$channel->flow(false)` 请求 Broker 暂停向客户端发送内容；Broker 主动发送 `channel.flow` 时客户端会自动回复，`isPublishingActive()` 可读取当前是否允许继续发布。事务使用 `txSelect()`、`txCommit()` 和 `txRollback()`。AMQP 事务与 Publisher Confirm 不能在同一 Channel 同时启用，客户端会在发送协议帧前拒绝这种组合。
+
 普通 `publish(..., mandatory: true)` 保持非阻塞；可通过 `setReturnHandler()` 接收之后读到的 `basic.return`，或通过 `popReturnedMessage()` 取出已解析的退回消息。若必须在本次调用中确定消息是否可路由，请使用 `publishConfirmed(..., mandatory: true)`；RabbitMQ 会先发送 `basic.return`，再发送 Publisher Confirm，客户端会完整读取两者并抛出 `MessageReturnedException`。
 
 一个连接可以建立多个 Channel。多个业务协程可以提交操作，客户端会在唯一的 I/O 协程中串行执行完整的请求/响应过程，避免 AMQP 帧交错；读取过程中遇到的其他 Channel 帧会按频道缓存。客户端本身不是连接池，也不会创建或管理多个连接。
@@ -114,6 +116,24 @@ $config = new Config(
     ),
 );
 ```
+
+RabbitMQ 使用客户端证书身份进行认证时，可启用 SASL EXTERNAL：
+
+```php
+$config = new Config(
+    host: 'rabbit.internal',
+    port: 5671,
+    authMechanism: Config::AUTH_EXTERNAL,
+    tls: new TlsConfig(
+        caFile: '/etc/rabbitmq/ca.pem',
+        clientCertificate: '/etc/rabbitmq/client.pem',
+        clientPrivateKey: '/etc/rabbitmq/client-key.pem',
+        serverName: 'rabbit.internal',
+    ),
+);
+```
+
+默认认证机制仍为 `Config::AUTH_PLAIN`。EXTERNAL 模式要求同时配置 TLS 客户端证书和私钥，并且 Broker 必须在 `connection.start` 中声明支持 `EXTERNAL`。
 
 `clientCertificate` 和 `clientPrivateKey` 必须同时配置。生产环境建议保持 `verifyPeer=true`；使用私有或自签 CA 时优先配置 `caFile`，不要直接关闭证书验证。
 

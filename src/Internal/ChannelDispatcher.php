@@ -19,6 +19,7 @@ final class ChannelDispatcher
     private array $returns = [];
     /** @var list<array{type:'delivery'|'cancel', value:Message|string}> */
     private array $consumerEvents = [];
+    private bool $publishingActive = true;
 
     public function __construct(
         private readonly Connection $connection,
@@ -32,6 +33,7 @@ final class ChannelDispatcher
     {
         while (true) {
             [$class, $method, $reader] = $this->connection->readMethod($this->channelId, $closeOnTimeout);
+            if ($this->handleServerFlow($class, $method, $reader)) continue;
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
                 $this->returns[] = $this->readReturn($reader);
                 continue;
@@ -68,6 +70,7 @@ final class ChannelDispatcher
         $returned = null;
         while ($this->confirms->hasPendingThrough($targetSequence)) {
             [$class, $method, $reader] = $this->connection->readMethod($this->channelId);
+            if ($this->handleServerFlow($class, $method, $reader)) continue;
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
                 $message = $this->readReturn($reader);
                 if ($captureReturn) $returned = $message;
@@ -107,6 +110,7 @@ final class ChannelDispatcher
         if ($queued !== null) return $queued;
         while (true) {
             [$class, $method, $reader] = $this->connection->readMethod($this->channelId, false);
+            if ($this->handleServerFlow($class, $method, $reader)) continue;
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
                 $this->returns[] = $this->readReturn($reader);
                 continue;
@@ -140,6 +144,7 @@ final class ChannelDispatcher
         $acked = []; $nacked = []; $returned = [];
         while ($this->confirms->hasPendingThrough($target)) {
             [$class, $method, $reader] = $this->connection->readMethod($this->channelId);
+            if ($this->handleServerFlow($class, $method, $reader)) continue;
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
                 $message = $this->readReturn($reader);
                 $returned[] = $message;
@@ -170,7 +175,21 @@ final class ChannelDispatcher
     public function popReturn(): ?ReturnedMessage { return array_shift($this->returns); }
     /** @return null|array{type:'delivery'|'cancel', value:Message|string} */
     public function popConsumerEvent(): ?array { return array_shift($this->consumerEvents); }
-    public function clear(): void { $this->returns = []; $this->consumerEvents = []; }
+    public function publishingActive(): bool { return $this->publishingActive; }
+    public function clear(): void { $this->returns = []; $this->consumerEvents = []; $this->publishingActive = true; }
+
+    private function handleServerFlow(int $class, int $method, Reader $reader): bool
+    {
+        if ($class !== Protocol::CHANNEL || $method !== Protocol::CHANNEL_FLOW) return false;
+        $this->publishingActive = $reader->bit();
+        $this->connection->send(Frame::method(
+            $this->channelId,
+            Protocol::CHANNEL,
+            Protocol::CHANNEL_FLOW_OK,
+            (new Writer())->bit($this->publishingActive)->bytes(),
+        ));
+        return true;
+    }
 
     /** @return list<int> */
     private function applyConfirmation(Reader $reader): array

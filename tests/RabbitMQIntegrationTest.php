@@ -201,6 +201,35 @@ final class RabbitMQIntegrationTest extends TestCase
         if ($error !== null) throw $error;
     }
 
+    public function testTransactionCommitAndRollback(): void
+    {
+        $error = null;
+        Coroutine\run(function () use (&$error): void {
+            $client = null; $channel = null; $queue = '';
+            try {
+                $client = new AMQP($this->config());
+                $channel = $client->channel();
+                $queue = $channel->queueDeclare('', exclusive: true, autoDelete: true)['queue'];
+                $channel->txSelect();
+                $channel->publish('committed', routingKey: $queue);
+                $channel->txCommit();
+                $committed = $this->waitForMessage($channel, $queue);
+                self::assertSame('committed', $committed->body);
+                $channel->ack($committed->deliveryTag);
+                $channel->txCommit();
+
+                $channel->publish('rolled-back', routingKey: $queue);
+                $channel->txRollback();
+                self::assertNull($channel->get($queue));
+            } catch (\Throwable $throwable) { $error = $throwable; }
+            finally {
+                if ($channel instanceof Channel && $queue !== '') try { $channel->queueDelete($queue); } catch (\Throwable) {}
+                $client?->close();
+            }
+        });
+        if ($error !== null) throw $error;
+    }
+
     private function waitForMessage(Channel $channel, string $queue): Message
     {
         $deadline = microtime(true) + 3;

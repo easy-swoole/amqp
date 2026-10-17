@@ -70,10 +70,13 @@ final class Connection
             [$class, $method, $start] = $this->readMethod(0);
             if ($class !== Protocol::CONNECTION || $method !== Protocol::CONNECTION_START) throw new ProtocolException('Expected connection.start.');
             $start->octet(); $start->octet(); $start->table(); $mechanisms = $start->longstr(); $locales = $start->longstr();
-            if (!str_contains(" {$mechanisms} ", ' PLAIN ')) throw new ProtocolException('Server does not support PLAIN authentication.');
+            $mechanism = $this->config->authMechanism;
+            $offeredMechanisms = preg_split('/\s+/', trim($mechanisms)) ?: [];
+            if (!in_array($mechanism, $offeredMechanisms, true)) throw new ProtocolException("Server does not support {$mechanism} authentication.");
             $locale = str_contains(" {$locales} ", ' en_US ') ? 'en_US' : strtok($locales, ' ');
+            $response = $mechanism === Config::AUTH_EXTERNAL ? '' : "\0{$this->config->user}\0{$this->config->password}";
             $args = (new Writer())->table(['product'=>'easyswoole/amqp','platform'=>'PHP','version'=>'1.0'])
-                ->shortstr('PLAIN')->longstr("\0{$this->config->user}\0{$this->config->password}")->shortstr((string) $locale)->bytes();
+                ->shortstr($mechanism)->longstr($response)->shortstr((string) $locale)->bytes();
             $this->transport->write(Frame::method(0, Protocol::CONNECTION, Protocol::CONNECTION_START_OK, $args)->encode());
             [$class, $method, $tune] = $this->readMethod(0);
             if ($class !== Protocol::CONNECTION || $method !== Protocol::CONNECTION_TUNE) throw new ProtocolException('Expected connection.tune.');

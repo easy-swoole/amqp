@@ -8,9 +8,9 @@ use EasySwoole\AMQP\Wire\Writer;
 
 final class ServerFrames
 {
-    public static function handshake(int $frameMax = 131072, int $heartbeat = 60, int $channelMax = 2047): string
+    public static function handshake(int $frameMax = 131072, int $heartbeat = 60, int $channelMax = 2047, string $mechanisms = 'AMQPLAIN PLAIN'): string
     {
-        $start = (new Writer())->octet(0)->octet(9)->table(['product'=>'RabbitMQ'])->longstr('AMQPLAIN PLAIN')->longstr('en_US')->bytes();
+        $start = (new Writer())->octet(0)->octet(9)->table(['product'=>'RabbitMQ'])->longstr($mechanisms)->longstr('en_US')->bytes();
         $tune = (new Writer())->short($channelMax)->long($frameMax)->short($heartbeat)->bytes();
         return Frame::method(0, 10, 10, $start)->encode() . Frame::method(0, 10, 30, $tune)->encode() . Frame::method(0, 10, 41)->encode();
     }

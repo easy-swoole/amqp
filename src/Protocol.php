@@ -12,6 +12,7 @@ final class Protocol
     public const QUEUE = 50;
     public const BASIC = 60;
     public const CONFIRM = 85;
+    public const TX = 90;
 
     public const CONNECTION_START = 10;
     public const CONNECTION_START_OK = 11;
@@ -24,6 +25,8 @@ final class Protocol
 
     public const CHANNEL_OPEN = 10;
     public const CHANNEL_OPEN_OK = 11;
+    public const CHANNEL_FLOW = 20;
+    public const CHANNEL_FLOW_OK = 21;
     public const CHANNEL_CLOSE = 40;
     public const CHANNEL_CLOSE_OK = 41;
 
@@ -31,6 +34,13 @@ final class Protocol
     public const BASIC_DELIVER = 60;
     public const BASIC_ACK = 80;
     public const BASIC_NACK = 120;
+
+    public const TX_SELECT = 10;
+    public const TX_SELECT_OK = 11;
+    public const TX_COMMIT = 20;
+    public const TX_COMMIT_OK = 21;
+    public const TX_ROLLBACK = 30;
+    public const TX_ROLLBACK_OK = 31;
 
     private function __construct() {}
 }

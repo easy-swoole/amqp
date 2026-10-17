@@ -24,6 +24,7 @@ final class Channel
     private array $subscriptions = [];
     private bool $legacyConsumerActive = false;
     private bool $subscriptionWaitActive = false;
+    private bool $transactional = false;
     private bool $cancelRequested = false;
     /** @var null|callable(ReturnedMessage, Channel):void */
     private $returnHandler = null;
@@ -113,6 +114,36 @@ final class Channel
         if ($prefetchCount < 0 || $prefetchCount > 65535 || $prefetchSize < 0 || $prefetchSize > 0xffffffff) throw new \InvalidArgumentException('Invalid QoS values.');
         $this->operation(fn () => $this->rpc(60, 10, (new Writer())->long($prefetchSize)->short($prefetchCount)->bit($global)->bytes(), 60, 11));
     }
+    public function flow(bool $active): bool
+    {
+        return $this->operation(function () use ($active): bool {
+            return $this->rpc(Protocol::CHANNEL, Protocol::CHANNEL_FLOW, (new Writer())->bit($active)->bytes(), Protocol::CHANNEL, Protocol::CHANNEL_FLOW_OK)->bit();
+        });
+    }
+    public function isPublishingActive(): bool { return $this->dispatcher->publishingActive(); }
+    public function txSelect(): void
+    {
+        $this->operation(function (): void {
+            if ($this->confirms->enabled()) throw new \LogicException('Transactions and publisher confirms cannot be enabled on the same channel.');
+            if ($this->transactional) return;
+            $this->rpc(Protocol::TX, Protocol::TX_SELECT, '', Protocol::TX, Protocol::TX_SELECT_OK);
+            $this->transactional = true;
+        });
+    }
+    public function txCommit(): void
+    {
+        $this->operation(function (): void {
+            if (!$this->transactional) throw new \LogicException('Transaction mode is not enabled on this channel.');
+            $this->rpc(Protocol::TX, Protocol::TX_COMMIT, '', Protocol::TX, Protocol::TX_COMMIT_OK);
+        });
+    }
+    public function txRollback(): void
+    {
+        $this->operation(function (): void {
+            if (!$this->transactional) throw new \LogicException('Transaction mode is not enabled on this channel.');
+            $this->rpc(Protocol::TX, Protocol::TX_ROLLBACK, '', Protocol::TX, Protocol::TX_ROLLBACK_OK);
+        });
+    }
     /** @param array<string, mixed> $properties */
     public function publish(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false): void
     {
@@ -128,6 +159,7 @@ final class Channel
     public function enablePublisherConfirms(): void
     {
         $this->operation(function (): void {
+            if ($this->transactional) throw new \LogicException('Transactions and publisher confirms cannot be enabled on the same channel.');
             if ($this->confirms->enabled()) return;
             $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
             $this->confirms->enable();
@@ -137,6 +169,7 @@ final class Channel
     public function publishConfirmed(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false, float $timeout = 3.0): void
     {
         $returned = $this->operation(function () use ($body, $exchange, $routingKey, $properties, $mandatory): ?ReturnedMessage {
+            if ($this->transactional) throw new \LogicException('Confirmed publishing is unavailable in transaction mode.');
             if (!$this->confirms->enabled()) {
                 $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
                 $this->confirms->enable();
@@ -310,7 +343,7 @@ final class Channel
         foreach ($this->subscriptions as $subscription) $subscription->markCancelled();
         $this->subscriptions = [];
         $this->legacyConsumerActive = false; $this->subscriptionWaitActive = false;
-        $this->open = false; $this->cancelRequested = false; $this->endDeliveryCallback();
+        $this->open = false; $this->cancelRequested = false; $this->transactional = false; $this->endDeliveryCallback();
         $this->returnHandler = null;
         $this->confirms->reset(); $this->dispatcher->clear();
     }
@@ -349,6 +382,7 @@ final class Channel
     /** @param array<string, mixed> $properties */
     private function writePublish(string $body, string $exchange, string $routingKey, array $properties, bool $mandatory): int
     {
+        if (!$this->dispatcher->publishingActive()) throw new \LogicException('Publishing is paused by channel.flow.');
         $args = (new Writer())->short(0)->shortstr($exchange)->shortstr($routingKey)->bit($mandatory)->bit(false)->bytes();
         $this->connection->send(Frame::method($this->id, Protocol::BASIC, 40, $args));
         $propertyBytes = BasicProperties::encode($properties);
@@ -366,6 +400,7 @@ final class Channel
     private function publishBatchMessages(array $messages, float $timeout): PublisherConfirmResult
     {
         return $this->operation(function () use ($messages): PublisherConfirmResult {
+            if ($this->transactional) throw new \LogicException('Confirmed publishing is unavailable in transaction mode.');
             if (!$this->confirms->enabled()) {
                 $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
                 $this->confirms->enable();
