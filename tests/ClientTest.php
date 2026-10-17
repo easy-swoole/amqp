@@ -79,6 +79,55 @@ final class ClientTest extends TestCase
         });
         self::assertCount(1, $flowMethods);
     }
+    public function testFlowForAnotherChannelIsAppliedBeforeItsNextPublish(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(2, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(2, 20, 20, (new Writer())->bit(false)->bytes())
+            . ServerFrames::method(1, 50, 11, (new Writer())->shortstr('jobs')->long(0)->long(0)->bytes());
+        $transport = new MemoryTransport($incoming);
+        $client = new AMQP(new Config(), $transport);
+        $first = $client->channel(1);
+        $second = $client->channel(2);
+        self::assertSame('jobs', $first->queueDeclare('jobs')['queue']);
+        self::assertFalse($second->isPublishingActive());
+        $writtenBefore = strlen($transport->written);
+        try { $second->publish('must-not-be-written'); self::fail('Expected cross-channel publishing pause.'); }
+        catch (\LogicException) {}
+        self::assertSame($writtenBefore, strlen($transport->written));
+    }
+    public function testCloseForAnotherChannelIsAcknowledgedAndInvalidatedImmediately(): void
+    {
+        $close = (new Writer())->short(404)->shortstr('gone')->short(60)->short(40)->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(2, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(2, 20, 40, $close)
+            . ServerFrames::method(1, 50, 11, (new Writer())->shortstr('jobs')->long(0)->long(0)->bytes())
+            . ServerFrames::method(2, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(2, 50, 11, (new Writer())->shortstr('replacement')->long(0)->long(0)->bytes());
+        $transport = new MemoryTransport($incoming);
+        $client = new AMQP(new Config(), $transport);
+        $first = $client->channel(1);
+        $second = $client->channel(2);
+        self::assertSame('jobs', $first->queueDeclare('jobs')['queue']);
+        $replacement = $client->channel(2);
+        $writtenBefore = strlen($transport->written);
+        try { $second->publish('must-not-be-written'); self::fail('Expected asynchronous channel.close.'); }
+        catch (ProtocolException $error) {
+            self::assertSame(404, $error->replyCode);
+            self::assertSame(60, $error->classId);
+            self::assertSame(40, $error->methodId);
+        }
+        self::assertSame($writtenBefore, strlen($transport->written));
+        self::assertSame('replacement', $replacement->queueDeclare('replacement')['queue']);
+        $methods = array_map(
+            static fn (Frame $frame): array => array_slice($frame->methodParts(), 0, 2),
+            array_values(array_filter(self::writtenFrames($transport->written), static fn (Frame $frame): bool => $frame->type === Frame::METHOD)),
+        );
+        self::assertContains([20, 41], $methods);
+    }
     public function testTransactionsSelectCommitAndRollback(): void
     {
         $incoming = ServerFrames::handshake()

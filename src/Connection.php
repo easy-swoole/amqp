@@ -182,8 +182,9 @@ final class Connection
             throw $error;
         } finally { $this->writing = false; }
     }
-    public function releaseChannel(int $id): void
+    public function releaseChannel(int $id, ?Channel $expected = null): void
     {
+        if ($expected !== null && ($this->channels[$id] ?? null) !== $expected) return;
         unset($this->channels[$id], $this->pendingFrames[$id]);
         if ($id < $this->nextChannel) $this->nextChannel = $id;
     }
@@ -210,7 +211,12 @@ final class Connection
                 return $this->validateFrameForChannel($frame, $channel);
             }
             if ($frame->channel !== $channel) {
-                if (!isset($this->channels[$frame->channel])) {
+                $target = $this->channels[$frame->channel] ?? null;
+                if ($target instanceof Channel && $frame->type === Frame::METHOD) {
+                    [$class, $method, $reader] = $frame->methodParts();
+                    if ($target->handleAsyncMethod($class, $method, $reader)) continue;
+                }
+                if ($target === null) {
                     $this->closeTransport();
                     throw new ProtocolException("Frame received for unknown channel {$frame->channel}.");
                 }

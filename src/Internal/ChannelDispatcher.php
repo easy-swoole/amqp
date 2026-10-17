@@ -178,7 +178,7 @@ final class ChannelDispatcher
     public function publishingActive(): bool { return $this->publishingActive; }
     public function clear(): void { $this->returns = []; $this->consumerEvents = []; $this->publishingActive = true; }
 
-    private function handleServerFlow(int $class, int $method, Reader $reader): bool
+    public function handleServerFlow(int $class, int $method, Reader $reader): bool
     {
         if ($class !== Protocol::CHANNEL || $method !== Protocol::CHANNEL_FLOW) return false;
         $this->publishingActive = $reader->bit();

@@ -25,6 +25,7 @@ final class Channel
     private bool $legacyConsumerActive = false;
     private bool $subscriptionWaitActive = false;
     private bool $transactional = false;
+    private ?ProtocolException $asynchronousCloseError = null;
     private bool $cancelRequested = false;
     /** @var null|callable(ReturnedMessage, Channel):void */
     private $returnHandler = null;
@@ -121,6 +122,21 @@ final class Channel
         });
     }
     public function isPublishingActive(): bool { return $this->dispatcher->publishingActive(); }
+    /** @internal Called by the connection while routing asynchronous frames between channels. */
+    public function handleAsyncMethod(int $class, int $method, Reader $reader): bool
+    {
+        if ($this->dispatcher->handleServerFlow($class, $method, $reader)) return true;
+        if ($class !== Protocol::CHANNEL || $method !== Protocol::CHANNEL_CLOSE) return false;
+        $code = $reader->short();
+        $text = $reader->shortstr();
+        $failedClass = $reader->short();
+        $failedMethod = $reader->short();
+        $this->connection->send(Frame::method($this->id, Protocol::CHANNEL, Protocol::CHANNEL_CLOSE_OK));
+        $this->invalidate();
+        $this->asynchronousCloseError = new ProtocolException($text, $code, $failedClass, $failedMethod);
+        $this->connection->releaseChannel($this->id, $this);
+        return true;
+    }
     public function txSelect(): void
     {
         $this->operation(function (): void {
@@ -334,7 +350,7 @@ final class Channel
         } finally {
             $this->connection->execute(function (): void {
                 $this->invalidate();
-                $this->connection->releaseChannel($this->id);
+                $this->connection->releaseChannel($this->id, $this);
             });
         }
     }
@@ -344,6 +360,7 @@ final class Channel
         $this->subscriptions = [];
         $this->legacyConsumerActive = false; $this->subscriptionWaitActive = false;
         $this->open = false; $this->cancelRequested = false; $this->transactional = false; $this->endDeliveryCallback();
+        $this->asynchronousCloseError = null;
         $this->returnHandler = null;
         $this->confirms->reset(); $this->dispatcher->clear();
     }
@@ -421,12 +438,19 @@ final class Channel
     {
         $result = $this->connection->execute(function () use ($callback, $requireOpen): mixed {
             if ($this->busy) throw new \LogicException('Reentrant AMQP channel operation.');
-            if ($requireOpen && !$this->open) throw new \LogicException('AMQP channel is closed.');
+            if ($requireOpen && !$this->open) {
+                if ($this->asynchronousCloseError !== null) {
+                    $error = $this->asynchronousCloseError;
+                    $this->asynchronousCloseError = null;
+                    throw $error;
+                }
+                throw new \LogicException('AMQP channel is closed.');
+            }
             $this->busy = true;
             try { return $callback(); }
             catch (ProtocolException $error) {
                 if ($error->replyCode !== 0 || !$this->connection->isConnected()) {
-                    $this->open = false; $this->connection->releaseChannel($this->id);
+                    $this->open = false; $this->connection->releaseChannel($this->id, $this);
                 }
                 throw $error;
             } finally { $this->busy = false; }
