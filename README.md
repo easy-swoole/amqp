@@ -91,7 +91,7 @@ Channel flow control 可通过 `$channel->flow(false)` 请求 Broker 暂停向�
 
 每个 AMQP Channel 内部使用统一的事件分发器处理同步 RPC 响应和异步 `basic.deliver`、`basic.return`、Publisher ACK/NACK。消息内容组装与 Publisher Confirm 序号状态分别由独立内部组件维护，因此异步投递插入 RPC 或 Confirm 响应之前时不会丢失或错误归类。公开 API 不依赖这些内部实现。
 
-默认关闭 AMQP heartbeat。启用后，每个 AMQP 实例会创建一个定时器，但定时器只向内部操作队列投递心跳指令；所有 Socket 读写均由唯一的 I/O 协程串行执行。`close()` 会清除定时器、关闭连接并停止 I/O 协程。这里仅参考 Pool 的定时器生命周期管理，客户端本身不包含连接池或对象借还逻辑。单条入站消息默认限制为 64 MiB，可通过 `maxMessageSize` 调整。
+默认关闭 AMQP heartbeat。启用后，每个 AMQP 实例会创建一个定时器，但定时器只向内部操作队列投递心跳指令；所有 Socket 读写均由唯一的 I/O 协程串行执行。协商出 heartbeat 后，空闲消费者的 Socket 读取会按不超过 heartbeat/2 的时间片返回 worker，避免长期 `recvAll()` 阻塞心跳及其他 Channel 的操作；收到 Broker heartbeat 时也会回复并主动让出本轮消费者读取。`close()` 会清除定时器、关闭连接并停止 I/O 协程。这里仅参考 Pool 的定时器生命周期管理，客户端本身不包含连接池或对象借还逻辑。单条入站消息默认限制为 64 MiB，可通过 `maxMessageSize` 调整。
 
 `close()` 是幂等的尽力关闭操作：空闲时会发送 AMQP `connection.close` 并等待响应；若 worker 正阻塞在消费读取中，则关闭底层传输作为协程取消信号，待旧 worker 真正退出后才允许重新连接。关闭期间的新操作会被拒绝，避免旧、新 worker 同时操作一个 Socket。
 

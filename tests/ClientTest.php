@@ -15,6 +15,7 @@ use EasySwoole\AMQP\Tests\Support\MemoryTransport;
 use EasySwoole\AMQP\Tests\Support\BlockingTransport;
 use EasySwoole\AMQP\Tests\Support\ServerFrames;
 use EasySwoole\AMQP\Tests\Support\TimeoutTransport;
+use EasySwoole\AMQP\Transport\SwooleSocketTransport;
 use EasySwoole\AMQP\Wire\Frame;
 use EasySwoole\AMQP\Wire\Reader;
 use EasySwoole\AMQP\Wire\Writer;
@@ -620,6 +621,45 @@ final class ClientTest extends TestCase
             array_values(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::METHOD)),
         );
         self::assertContains([60, 31], $methods);
+    }
+    public function testHeartbeatYieldsConsumerReadWithoutClosingConnection(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('consumer')->bytes())
+            . (new Frame(Frame::HEARTBEAT, 0, ''))->encode()
+            . ServerFrames::method(1, 60, 31, (new Writer())->shortstr('consumer')->bytes());
+        $transport = new MemoryTransport($incoming);
+        $client = new AMQP(new Config(), $transport);
+        $channel = $client->channel();
+        self::assertSame('consumer', $channel->consume('jobs', static fn (): null => null, 'consumer'));
+        self::assertTrue($client->isConnected());
+        $heartbeats = array_filter(self::writtenFrames($transport->written), static fn (Frame $frame): bool => $frame->type === Frame::HEARTBEAT);
+        self::assertCount(1, $heartbeats);
+    }
+    public function testFiniteSubscriptionWaitContinuesAfterHeartbeatYield(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('consumer')->bytes())
+            . (new Frame(Frame::HEARTBEAT, 0, ''))->encode()
+            . ServerFrames::method(1, 60, 31, (new Writer())->shortstr('consumer')->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $subscription = $channel->subscribe('jobs', static fn (): null => null, 'consumer');
+        $channel->wait(1.0);
+        self::assertFalse($subscription->isActive());
+    }
+    public function testSwooleTransportSlicesIdleReadsToHeartbeatCadence(): void
+    {
+        $transport = new SwooleSocketTransport(new Config(readTimeout: 60));
+        $effective = new \ReflectionMethod($transport, 'effectiveReadTimeout');
+        self::assertSame(60.0, $effective->invoke($transport));
+        $transport->setHeartbeatInterval(10);
+        self::assertSame(5.0, $effective->invoke($transport));
+
+        $unbounded = new SwooleSocketTransport(new Config(readTimeout: -1));
+        $unbounded->setHeartbeatInterval(1);
+        self::assertSame(0.5, $effective->invoke($unbounded));
     }
     public function testMultipleSubscriptionsAreRoutedByConsumerTag(): void
     {

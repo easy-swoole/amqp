@@ -6,6 +6,7 @@ namespace EasySwoole\AMQP;
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Exception\TimeoutException;
 use EasySwoole\AMQP\Transport\SwooleSocketTransport;
+use EasySwoole\AMQP\Transport\HeartbeatAwareTransportInterface;
 use EasySwoole\AMQP\Transport\TransportInterface;
 use EasySwoole\AMQP\Wire\Frame;
 use EasySwoole\AMQP\Wire\Reader;
@@ -66,6 +67,7 @@ final class Connection
     private function handshake(): void
     {
         try {
+            if ($this->transport instanceof HeartbeatAwareTransportInterface) $this->transport->setHeartbeatInterval(0);
             $this->transport->connect(); $this->transport->write(self::PROTOCOL_HEADER);
             [$class, $method, $start] = $this->readMethod(0);
             if ($class !== Protocol::CONNECTION || $method !== Protocol::CONNECTION_START) throw new ProtocolException('Expected connection.start.');
@@ -87,6 +89,7 @@ final class Connection
             $serverHeartbeat = $tune->short();
             // A client value of zero explicitly disables heartbeats, matching php-amqplib compatibility semantics.
             $this->heartbeat = $this->config->heartbeat === 0 ? 0 : self::negotiate($this->config->heartbeat, $serverHeartbeat);
+            if ($this->transport instanceof HeartbeatAwareTransportInterface) $this->transport->setHeartbeatInterval($this->heartbeat);
             $tuneOk = (new Writer())->short($this->channelMax)->long($this->frameMax)->short($this->heartbeat)->bytes();
             $this->transport->write(Frame::method(0, Protocol::CONNECTION, Protocol::CONNECTION_TUNE_OK, $tuneOk)->encode());
             $open = (new Writer())->shortstr($this->config->vhost)->shortstr('')->bit(false)->bytes();
@@ -205,7 +208,11 @@ final class Connection
                 if ($closeOnTimeout || $segmentsRead > 0) $this->closeTransport();
                 throw $error;
             } catch (\Throwable $error) { $this->closeTransport(); throw $error; }
-            if ($frame->type === Frame::HEARTBEAT) { $this->send(new Frame(Frame::HEARTBEAT, 0, '')); continue; }
+            if ($frame->type === Frame::HEARTBEAT) {
+                $this->send(new Frame(Frame::HEARTBEAT, 0, ''));
+                if (!$closeOnTimeout) throw new TimeoutException('AMQP consumer read yielded after heartbeat.');
+                continue;
+            }
             if ($frame->channel === 0 && $this->handleConnectionControl($frame)) continue;
             if ($channel !== 0 && $frame->channel === 0 && $this->isConnectionClose($frame)) {
                 return $this->validateFrameForChannel($frame, $channel);
@@ -395,7 +402,7 @@ final class Connection
         $this->clearHeartbeatTimer();
         if ($this->heartbeat <= 0 || Coroutine::getCid() < 0) return;
         $weak = \WeakReference::create($this);
-        $timerId = Timer::tick(max(1000, intdiv($this->heartbeat * 1000, 2)), static function () use ($weak): void {
+        $timerId = Timer::tick(max(1, intdiv($this->heartbeat * 1000, 2)), static function () use ($weak): void {
             $self = $weak->get();
             if (!$self instanceof self || !$self->workerRunning || !$self->operations) return;
             // The timer only submits work. The socket remains owned by the I/O worker.

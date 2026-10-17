@@ -286,7 +286,8 @@ final class Channel
             if ($remaining !== -1.0 && $remaining <= 0) throw new TimeoutException('Consumer wait deadline exceeded.');
             try { $event = $this->operation(fn (): array => $this->dispatcher->nextConsumerEvent(), true, $remaining); }
             catch (TimeoutException $error) {
-                if (!$this->open || !$this->connection->isConnected() || $deadline !== null) throw $error;
+                if (!$this->open || !$this->connection->isConnected()) throw $error;
+                if ($deadline !== null && microtime(true) >= $deadline) throw new TimeoutException('Consumer wait deadline exceeded.');
                 continue;
             }
             $tag = $event['type'] === 'delivery' ? $event['value']->consumerTag : $event['value'];

@@ -9,9 +9,10 @@ use EasySwoole\AMQP\Exception\TimeoutException;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Socket;
 
-final class SwooleSocketTransport implements TransportInterface
+final class SwooleSocketTransport implements TransportInterface, HeartbeatAwareTransportInterface
 {
     private ?Socket $socket = null;
+    private int $heartbeat = 0;
     public function __construct(private readonly Config $config) {}
     public function connect(): void
     {
@@ -27,7 +28,7 @@ final class SwooleSocketTransport implements TransportInterface
     }
     public function read(int $length): string
     {
-        $data = $this->socket?->recvAll($length, $this->config->readTimeout);
+        $data = $this->socket?->recvAll($length, $this->effectiveReadTimeout());
         if (($data === false || $data === '') && $length > 0 && $this->isTimeoutError()) {
             throw new TimeoutException('AMQP read timed out.', $this->socket?->errCode ?? 0);
         }
@@ -35,6 +36,7 @@ final class SwooleSocketTransport implements TransportInterface
         return $data;
     }
     public function isConnected(): bool { return $this->socket !== null; }
+    public function setHeartbeatInterval(int $seconds): void { $this->heartbeat = max(0, $seconds); }
     public function close(): void { $socket = $this->socket; $this->socket = null; $socket?->close(); }
     private function fail(string $operation): never
     {
@@ -47,5 +49,11 @@ final class SwooleSocketTransport implements TransportInterface
         $timeoutCodes = [60, 110];
         if (defined('SOCKET_ETIMEDOUT')) $timeoutCodes[] = constant('SOCKET_ETIMEDOUT');
         return in_array($code, $timeoutCodes, true) || str_contains(strtolower($this->socket?->errMsg ?? ''), 'timed out');
+    }
+    private function effectiveReadTimeout(): float
+    {
+        if ($this->heartbeat <= 0) return $this->config->readTimeout;
+        $slice = max(0.1, $this->heartbeat / 2);
+        return $this->config->readTimeout === -1.0 ? $slice : min($this->config->readTimeout, $slice);
     }
 }

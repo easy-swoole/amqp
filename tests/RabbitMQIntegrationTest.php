@@ -175,6 +175,42 @@ final class RabbitMQIntegrationTest extends TestCase
         self::assertSame('idle-consumer', $returnedTag);
     }
 
+    public function testHeartbeatDoesNotStarveOperationsBehindIdleConsumer(): void
+    {
+        $error = null; $received = null;
+        Coroutine\run(function () use (&$error, &$received): void {
+            $client = null; $control = null; $queue = '';
+            try {
+                $client = new AMQP($this->config(2, 10));
+                $control = $client->channel();
+                $consumer = $client->channel();
+                $queue = $control->queueDeclare('', exclusive: true, autoDelete: true)['queue'];
+                $done = new Coroutine\Channel(1);
+                Coroutine::create(function () use ($consumer, $queue, $done, &$received): void {
+                    try {
+                        $consumer->consume($queue, function (Message $message, Channel $channel) use (&$received): bool {
+                            $received = $message->body;
+                            $channel->cancel((string) $message->consumerTag);
+                            return true;
+                        }, 'heartbeat-consumer');
+                        $done->push(null);
+                    } catch (\Throwable $throwable) { $done->push($throwable); }
+                });
+                Coroutine::sleep(3.2);
+                $control->publishConfirmed('after-idle-consumer', routingKey: $queue, timeout: 5);
+                $result = $done->pop(5);
+                if ($result instanceof \Throwable) throw $result;
+                if ($result === false) throw new \RuntimeException('Consumer remained starved behind its socket read.');
+            } catch (\Throwable $throwable) { $error = $throwable; }
+            finally {
+                if ($control instanceof Channel && $queue !== '') try { $control->queueDelete($queue); } catch (\Throwable) {}
+                $client?->close();
+            }
+        });
+        if ($error !== null) throw $error;
+        self::assertSame('after-idle-consumer', $received);
+    }
+
     public function testMandatoryPublishReturnsUnroutableMessageAndKeepsChannelUsable(): void
     {
         $error = null;
