@@ -6,8 +6,12 @@ namespace EasySwoole\AMQP;
 use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Exception\PublisherNackException;
+use EasySwoole\AMQP\Exception\ChannelClosedException;
+use EasySwoole\AMQP\Exception\ConnectionClosedByBrokerException;
 use EasySwoole\AMQP\Exception\TimeoutException;
 use EasySwoole\AMQP\Internal\ChannelDispatcher;
+use EasySwoole\AMQP\Internal\ChannelState;
+use EasySwoole\AMQP\Internal\ChannelEndpoint;
 use EasySwoole\AMQP\Internal\ContentReader;
 use EasySwoole\AMQP\Internal\PublisherConfirmTracker;
 use EasySwoole\AMQP\Wire\Frame;
@@ -17,32 +21,32 @@ use EasySwoole\AMQP\Wire\Writer;
 
 final class Channel
 {
-    private bool $open = false;
-    private bool $busy = false;
-    private ?int $callbackDeliveryTag = null;
-    private bool $callbackSettled = false;
     /** @var array<string, Subscription> */
     private array $subscriptions = [];
-    private bool $legacyConsumerActive = false;
-    private bool $subscriptionWaitActive = false;
-    private bool $transactional = false;
-    private ?ProtocolException $asynchronousCloseError = null;
-    private bool $cancelRequested = false;
     /** @var null|callable(ReturnedMessage, Channel):void */
     private $returnHandler = null;
     private readonly ContentReader $contentReader;
     private readonly PublisherConfirmTracker $confirms;
     private readonly ChannelDispatcher $dispatcher;
+    private readonly ChannelState $state;
+    private readonly ChannelEndpoint $endpoint;
     public function __construct(private readonly Connection $connection, public readonly int $id)
     {
         $this->contentReader = new ContentReader($connection, $id);
         $this->confirms = new PublisherConfirmTracker();
         $this->dispatcher = new ChannelDispatcher($connection, $id, $this->contentReader, $this->confirms);
+        $this->state = new ChannelState();
+        $this->endpoint = new ChannelEndpoint(
+            fn (int $class, int $method, Reader $reader): bool => $this->handleAsyncMethod($class, $method, $reader),
+            function (): void { $this->invalidate(); },
+        );
     }
+    /** @internal */
+    public function endpoint(): ChannelEndpoint { return $this->endpoint; }
     public function open(): void
     {
         $this->operation(function (): void {
-            $this->rpc(20, 10, (new Writer())->shortstr('')->bytes(), 20, 11); $this->open = true;
+            $this->rpc(20, 10, (new Writer())->shortstr('')->bytes(), 20, 11); $this->state->open = true;
         }, false);
     }
     public function exchangeDeclare(string $exchange, string $type = 'direct', bool $passive = false, bool $durable = false, bool $autoDelete = false, bool $internal = false, array $arguments = []): void
@@ -124,7 +128,7 @@ final class Channel
     }
     public function isPublishingActive(): bool { return $this->dispatcher->publishingActive(); }
     /** @internal Called by the connection while routing asynchronous frames between channels. */
-    public function handleAsyncMethod(int $class, int $method, Reader $reader): bool
+    private function handleAsyncMethod(int $class, int $method, Reader $reader): bool
     {
         if ($this->dispatcher->handleServerFlow($class, $method, $reader)) return true;
         if ($class !== Protocol::CHANNEL || $method !== Protocol::CHANNEL_CLOSE) return false;
@@ -134,30 +138,30 @@ final class Channel
         $failedMethod = $reader->short();
         $this->connection->send(Frame::method($this->id, Protocol::CHANNEL, Protocol::CHANNEL_CLOSE_OK));
         $this->invalidate();
-        $this->asynchronousCloseError = new ProtocolException($text, $code, $failedClass, $failedMethod);
-        $this->connection->releaseChannel($this->id, $this);
+        $this->state->asynchronousCloseError = new ChannelClosedException($text, $code, $failedClass, $failedMethod);
+        $this->connection->releaseChannel($this->id, $this->endpoint);
         return true;
     }
     public function txSelect(): void
     {
         $this->operation(function (): void {
             if ($this->confirms->enabled()) throw new \LogicException('Transactions and publisher confirms cannot be enabled on the same channel.');
-            if ($this->transactional) return;
+            if ($this->state->transactional) return;
             $this->rpc(Protocol::TX, Protocol::TX_SELECT, '', Protocol::TX, Protocol::TX_SELECT_OK);
-            $this->transactional = true;
+            $this->state->transactional = true;
         });
     }
     public function txCommit(): void
     {
         $this->operation(function (): void {
-            if (!$this->transactional) throw new \LogicException('Transaction mode is not enabled on this channel.');
+            if (!$this->state->transactional) throw new \LogicException('Transaction mode is not enabled on this channel.');
             $this->rpc(Protocol::TX, Protocol::TX_COMMIT, '', Protocol::TX, Protocol::TX_COMMIT_OK);
         });
     }
     public function txRollback(): void
     {
         $this->operation(function (): void {
-            if (!$this->transactional) throw new \LogicException('Transaction mode is not enabled on this channel.');
+            if (!$this->state->transactional) throw new \LogicException('Transaction mode is not enabled on this channel.');
             $this->rpc(Protocol::TX, Protocol::TX_ROLLBACK, '', Protocol::TX, Protocol::TX_ROLLBACK_OK);
         });
     }
@@ -176,7 +180,7 @@ final class Channel
     public function enablePublisherConfirms(): void
     {
         $this->operation(function (): void {
-            if ($this->transactional) throw new \LogicException('Transactions and publisher confirms cannot be enabled on the same channel.');
+            if ($this->state->transactional) throw new \LogicException('Transactions and publisher confirms cannot be enabled on the same channel.');
             if ($this->confirms->enabled()) return;
             $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
             $this->confirms->enable();
@@ -186,7 +190,7 @@ final class Channel
     public function publishConfirmed(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false, float $timeout = 3.0): void
     {
         $returned = $this->operation(function () use ($body, $exchange, $routingKey, $properties, $mandatory): ?ReturnedMessage {
-            if ($this->transactional) throw new \LogicException('Confirmed publishing is unavailable in transaction mode.');
+            if ($this->state->transactional) throw new \LogicException('Confirmed publishing is unavailable in transaction mode.');
             if (!$this->confirms->enabled()) {
                 $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
                 $this->confirms->enable();
@@ -220,15 +224,15 @@ final class Channel
     }
     public function consume(string $queue, callable $handler, string $consumerTag = '', bool $autoAck = false, bool $exclusive = false, array $arguments = []): string
     {
-        if ($this->legacyConsumerActive || $this->subscriptions !== []) throw new \LogicException('This channel already has an active consumer API.');
-        $this->legacyConsumerActive = true;
+        if ($this->state->legacyConsumerActive || $this->subscriptions !== []) throw new \LogicException('This channel already has an active consumer API.');
+        $this->state->legacyConsumerActive = true;
         try {
         $tag = $this->operation(function () use ($queue, $consumerTag, $autoAck, $exclusive, $arguments): string {
             $args = (new Writer())->short(0)->shortstr($queue)->shortstr($consumerTag)->bit(false)->bit($autoAck)->bit($exclusive)->bit(false)->table($arguments)->bytes();
             return $this->rpc(60, 20, $args, 60, 21)->shortstr();
         });
         // 每次只让 I/O worker 读取一条投递，回调仍在调用方协程执行，允许安全 ack/nack。
-        while ($this->open) {
+        while ($this->state->open) {
             try {
                 $message = $this->operation(function () use ($tag): ?Message {
                     $event = $this->dispatcher->nextConsumerEvent();
@@ -237,33 +241,33 @@ final class Channel
                         $this->connection->abort();
                         throw new ProtocolException("Consumer event references unexpected tag {$eventTag}; expected {$tag}.");
                     }
-                    if ($event['type'] === 'cancel') { $this->cancelRequested = false; return null; }
+                    if ($event['type'] === 'cancel') { $this->state->cancelRequested = false; return null; }
                     return $event['value'];
                 });
             } catch (TimeoutException $error) {
-                if (!$this->open || !$this->connection->isConnected()) throw $error;
+                if (!$this->state->open || !$this->connection->isConnected()) throw $error;
                 continue;
             }
             if ($message === null) break;
             $deliveryTag = $message->deliveryTag;
-            $this->beginDeliveryCallback($deliveryTag);
+            $this->state->beginDelivery($deliveryTag);
             try { $result = $handler($message, $this); }
             catch (\Throwable $error) {
-                if (!$autoAck && $this->open && !$this->callbackSettled) {
+                if (!$autoAck && $this->state->open && !$this->state->callbackSettled()) {
                     try { $this->nack($deliveryTag, false, true); }
                     catch (\Throwable $nackError) { throw new \RuntimeException('Consumer callback and NACK both failed: ' . $nackError->getMessage(), 0, $error); }
                 }
                 throw $error;
             }
-            finally { $settled = $this->callbackSettled; $this->endDeliveryCallback(); }
-            if (!$autoAck && $this->open && !$settled) $result === false ? $this->nack($deliveryTag, false, true) : $this->ack($deliveryTag);
+            finally { $settled = $this->state->callbackSettled(); $this->state->endDelivery(); }
+            if (!$autoAck && $this->state->open && !$settled) $result === false ? $this->nack($deliveryTag, false, true) : $this->ack($deliveryTag);
         }
         return $tag;
-        } finally { $this->legacyConsumerActive = false; }
+        } finally { $this->state->legacyConsumerActive = false; }
     }
     public function subscribe(string $queue, callable $handler, string $consumerTag = '', bool $autoAck = false, bool $exclusive = false, array $arguments = []): Subscription
     {
-        if ($this->legacyConsumerActive) throw new \LogicException('Cannot subscribe while blocking consume() is active on this channel.');
+        if ($this->state->legacyConsumerActive) throw new \LogicException('Cannot subscribe while blocking consume() is active on this channel.');
         $tag = $this->operation(function () use ($queue, $consumerTag, $autoAck, $exclusive, $arguments): string {
             $args = (new Writer())->short(0)->shortstr($queue)->shortstr($consumerTag)->bit(false)->bit($autoAck)->bit($exclusive)->bit(false)->table($arguments)->bytes();
             return $this->rpc(Protocol::BASIC, 20, $args, Protocol::BASIC, 21)->shortstr();
@@ -277,8 +281,8 @@ final class Channel
     public function wait(float $timeout = -1.0): void
     {
         if (!is_finite($timeout) || ($timeout <= 0 && $timeout !== -1.0)) throw new \InvalidArgumentException('Wait timeout must be positive seconds or -1.');
-        if ($this->subscriptionWaitActive) throw new \LogicException('A subscription wait loop is already active on this channel.');
-        $this->subscriptionWaitActive = true;
+        if ($this->state->subscriptionWaitActive) throw new \LogicException('A subscription wait loop is already active on this channel.');
+        $this->state->subscriptionWaitActive = true;
         try {
         $deadline = $timeout === -1.0 ? null : microtime(true) + $timeout;
         while ($this->subscriptions !== []) {
@@ -286,7 +290,7 @@ final class Channel
             if ($remaining !== -1.0 && $remaining <= 0) throw new TimeoutException('Consumer wait deadline exceeded.');
             try { $event = $this->operation(fn (): array => $this->dispatcher->nextConsumerEvent(), true, $remaining); }
             catch (TimeoutException $error) {
-                if (!$this->open || !$this->connection->isConnected()) throw $error;
+                if (!$this->state->open || !$this->connection->isConnected()) throw $error;
                 if ($deadline !== null && microtime(true) >= $deadline) throw new TimeoutException('Consumer wait deadline exceeded.');
                 continue;
             }
@@ -301,27 +305,27 @@ final class Channel
             }
             /** @var Message $message */
             $message = $event['value'];
-            $this->beginDeliveryCallback($message->deliveryTag);
+            $this->state->beginDelivery($message->deliveryTag);
             try { $result = $subscription->dispatch($message); }
             catch (\Throwable $error) {
-                if (!$subscription->autoAck && $this->open && !$this->callbackSettled) {
+                if (!$subscription->autoAck && $this->state->open && !$this->state->callbackSettled()) {
                     try { $this->nack($message->deliveryTag, false, true); }
                     catch (\Throwable $nackError) { throw new \RuntimeException('Consumer callback and NACK both failed: ' . $nackError->getMessage(), 0, $error); }
                 }
                 throw $error;
             }
-            finally { $settled = $this->callbackSettled; $this->endDeliveryCallback(); }
-            if (!$subscription->autoAck && $this->open && !$settled) {
+            finally { $settled = $this->state->callbackSettled(); $this->state->endDelivery(); }
+            if (!$subscription->autoAck && $this->state->open && !$settled) {
                 $result === false ? $this->nack($message->deliveryTag, false, true) : $this->ack($message->deliveryTag);
             }
         }
-        } finally { $this->subscriptionWaitActive = false; }
+        } finally { $this->state->subscriptionWaitActive = false; }
     }
     public function cancel(string $consumerTag): void
     {
         $this->operation(function () use ($consumerTag): void {
             $this->connection->send(Frame::method($this->id, Protocol::BASIC, 30, (new Writer())->shortstr($consumerTag)->bit(false)->bytes()));
-            $this->cancelRequested = true;
+            $this->state->cancelRequested = true;
         });
     }
     public function ack(int $deliveryTag, bool $multiple = false): void { $this->sendAck(80, $deliveryTag, $multiple, null); }
@@ -331,7 +335,7 @@ final class Channel
         if ($deliveryTag <= 0) throw new \InvalidArgumentException('Reject delivery-tag must be positive.');
         $this->operation(function () use ($deliveryTag, $requeue): void {
             $this->connection->send(Frame::method($this->id, 60, 90, (new Writer())->longlong($deliveryTag)->bit($requeue)->bytes()));
-            $this->markCallbackSettled($deliveryTag, false);
+            $this->state->markSettled($deliveryTag, false);
         });
     }
     public function recover(bool $requeue = false): void
@@ -344,7 +348,7 @@ final class Channel
     }
     public function close(): void
     {
-        if (!$this->open) return;
+        if (!$this->state->open) return;
         try {
             $this->operation(function (): void {
                 $args = (new Writer())->short(200)->shortstr('Goodbye')->short(0)->short(0)->bytes(); $this->rpc(20, 40, $args, 20, 41);
@@ -352,7 +356,7 @@ final class Channel
         } finally {
             $this->connection->execute(function (): void {
                 $this->invalidate();
-                $this->connection->releaseChannel($this->id, $this);
+                $this->connection->releaseChannel($this->id, $this->endpoint);
             });
         }
     }
@@ -360,9 +364,7 @@ final class Channel
     {
         foreach ($this->subscriptions as $subscription) $subscription->markCancelled();
         $this->subscriptions = [];
-        $this->legacyConsumerActive = false; $this->subscriptionWaitActive = false;
-        $this->open = false; $this->cancelRequested = false; $this->transactional = false; $this->endDeliveryCallback();
-        $this->asynchronousCloseError = null;
+        $this->state->reset();
         $this->returnHandler = null;
         $this->confirms->reset(); $this->dispatcher->clear();
     }
@@ -372,25 +374,8 @@ final class Channel
         $this->operation(function () use ($method, $tag, $multiple, $requeue): void {
             $writer = (new Writer())->longlong($tag)->bit($multiple); if ($requeue !== null) $writer->bit($requeue);
             $this->connection->send(Frame::method($this->id, 60, $method, $writer->bytes()));
-            $this->markCallbackSettled($tag, $multiple);
+            $this->state->markSettled($tag, $multiple);
         });
-    }
-    private function beginDeliveryCallback(int $deliveryTag): void
-    {
-        $this->callbackDeliveryTag = $deliveryTag;
-        $this->callbackSettled = false;
-    }
-    private function endDeliveryCallback(): void
-    {
-        $this->callbackDeliveryTag = null;
-        $this->callbackSettled = false;
-    }
-    private function markCallbackSettled(int $deliveryTag, bool $multiple): void
-    {
-        if ($this->callbackDeliveryTag === null) return;
-        if ($multiple ? ($deliveryTag === 0 || $this->callbackDeliveryTag <= $deliveryTag) : $this->callbackDeliveryTag === $deliveryTag) {
-            $this->callbackSettled = true;
-        }
     }
     private function rpc(int $class, int $method, string $args, int $expectedClass, int $expectedMethod): Reader
     {
@@ -419,7 +404,7 @@ final class Channel
     private function publishBatchMessages(array $messages, float $timeout): PublisherConfirmResult
     {
         return $this->operation(function () use ($messages): PublisherConfirmResult {
-            if ($this->transactional) throw new \LogicException('Confirmed publishing is unavailable in transaction mode.');
+            if ($this->state->transactional) throw new \LogicException('Confirmed publishing is unavailable in transaction mode.');
             if (!$this->confirms->enabled()) {
                 $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
                 $this->confirms->enable();
@@ -439,26 +424,27 @@ final class Channel
     private function operation(callable $callback, bool $requireOpen = true, ?float $timeout = null): mixed
     {
         $result = $this->connection->execute(function () use ($callback, $requireOpen): mixed {
-            if ($this->busy) throw new \LogicException('Reentrant AMQP channel operation.');
-            if ($requireOpen && !$this->open) {
-                if ($this->asynchronousCloseError !== null) {
-                    $error = $this->asynchronousCloseError;
-                    $this->asynchronousCloseError = null;
+            if ($this->state->busy) throw new \LogicException('Reentrant AMQP channel operation.');
+            if ($requireOpen && !$this->state->open) {
+                if ($this->state->asynchronousCloseError !== null) {
+                    $error = $this->state->asynchronousCloseError;
+                    $this->state->asynchronousCloseError = null;
                     throw $error;
                 }
                 throw new \LogicException('AMQP channel is closed.');
             }
-            $this->busy = true;
+            $this->state->busy = true;
             try { return $callback(); }
             catch (ProtocolException $error) {
-                if (!($error instanceof PublisherNackException) && $error->replyCode === 0 && $this->connection->isConnected()) {
-                    $this->connection->abort();
+                if ($error instanceof PublisherNackException) throw $error;
+                if ($error instanceof ChannelClosedException) {
+                    $this->state->open = false; $this->connection->releaseChannel($this->id, $this->endpoint);
+                    throw $error;
                 }
-                if (!($error instanceof PublisherNackException)) {
-                    $this->open = false; $this->connection->releaseChannel($this->id, $this);
-                }
+                if (!($error instanceof ConnectionClosedByBrokerException) && $this->connection->isConnected()) $this->connection->abort();
+                $this->state->open = false; $this->connection->releaseChannel($this->id, $this->endpoint);
                 throw $error;
-            } finally { $this->busy = false; }
+            } finally { $this->state->busy = false; }
         }, $timeout);
         $this->dispatchReturnedMessages();
         return $result;

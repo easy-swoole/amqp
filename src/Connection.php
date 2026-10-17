@@ -4,9 +4,12 @@ declare(strict_types=1);
 namespace EasySwoole\AMQP;
 
 use EasySwoole\AMQP\Exception\ProtocolException;
+use EasySwoole\AMQP\Exception\ChannelClosedException;
+use EasySwoole\AMQP\Exception\ConnectionClosedByBrokerException;
 use EasySwoole\AMQP\Exception\TimeoutException;
 use EasySwoole\AMQP\Transport\SwooleSocketTransport;
 use EasySwoole\AMQP\Transport\HeartbeatAwareTransportInterface;
+use EasySwoole\AMQP\Internal\ChannelEndpoint;
 use EasySwoole\AMQP\Transport\TransportInterface;
 use EasySwoole\AMQP\Wire\Frame;
 use EasySwoole\AMQP\Wire\Reader;
@@ -30,7 +33,7 @@ final class Connection
     private bool $workerBusy = false;
     private bool $closing = false;
     private ?int $heartbeatTimerId = null;
-    /** @var array<int, true|Channel> */
+    /** @var array<int, true|ChannelEndpoint> */
     private array $channels = [];
     /** @var array<int, list<Frame>> */
     private array $pendingFrames = [];
@@ -118,7 +121,7 @@ final class Connection
         });
         try {
             $channel = new Channel($this, $id);
-            $this->execute(function () use ($channel, $id): void { $this->channels[$id] = $channel; });
+            $this->execute(function () use ($channel, $id): void { $this->channels[$id] = $channel->endpoint(); });
             $channel->open();
             return $channel;
         }
@@ -185,7 +188,7 @@ final class Connection
             throw $error;
         } finally { $this->writing = false; }
     }
-    public function releaseChannel(int $id, ?Channel $expected = null): void
+    public function releaseChannel(int $id, ?ChannelEndpoint $expected = null): void
     {
         if ($expected !== null && ($this->channels[$id] ?? null) !== $expected) return;
         unset($this->channels[$id], $this->pendingFrames[$id]);
@@ -219,9 +222,9 @@ final class Connection
             }
             if ($frame->channel !== $channel) {
                 $target = $this->channels[$frame->channel] ?? null;
-                if ($target instanceof Channel && $frame->type === Frame::METHOD) {
+                if ($target instanceof ChannelEndpoint && $frame->type === Frame::METHOD) {
                     [$class, $method, $reader] = $frame->methodParts();
-                    if ($target->handleAsyncMethod($class, $method, $reader)) continue;
+                    if ($target->handleMethod($class, $method, $reader)) continue;
                 }
                 if ($target === null) {
                     $this->closeTransport();
@@ -240,8 +243,11 @@ final class Connection
         if (($class === 10 && $method === 50) || ($class === 20 && $method === 40)) {
             $code = $reader->short(); $text = $reader->shortstr(); $failedClass = $reader->short(); $failedMethod = $reader->short();
             $this->send(Frame::method($channel, $class, $method + 1));
-            if ($class === 10) $this->closeTransport();
-            throw new ProtocolException($text, $code, $failedClass, $failedMethod);
+            if ($class === Protocol::CONNECTION) {
+                $this->closeTransport();
+                throw new ConnectionClosedByBrokerException($text, $code, $failedClass, $failedMethod);
+            }
+            throw new ChannelClosedException($text, $code, $failedClass, $failedMethod);
         }
         return [$class, $method, $reader];
     }
@@ -287,7 +293,7 @@ final class Connection
             $code = $reader->short(); $text = $reader->shortstr(); $failedClass = $reader->short(); $failedMethod = $reader->short();
             try { $this->send(Frame::method(0, Protocol::CONNECTION, Protocol::CONNECTION_CLOSE_OK)); } catch (\Throwable) {}
             $this->closeTransport();
-            throw new ProtocolException($text, $code, $failedClass, $failedMethod);
+            throw new ConnectionClosedByBrokerException($text, $code, $failedClass, $failedMethod);
         }
         return $frame;
     }
@@ -310,7 +316,7 @@ final class Connection
     {
         $this->clearHeartbeatTimer();
         $this->connected = false;
-        foreach ($this->channels as $channel) if ($channel instanceof Channel) $channel->invalidate();
+        foreach ($this->channels as $channel) if ($channel instanceof ChannelEndpoint) $channel->invalidate();
         $this->channels = []; $this->pendingFrames = []; $this->blockedReason = null; $this->nextChannel = 1;
         $this->transport->close();
     }

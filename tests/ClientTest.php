@@ -733,8 +733,9 @@ final class ClientTest extends TestCase
             . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
         $channel = (new AMQP(new Config(), $transport))->channel();
         for ($tag = 1; $tag <= 1000; $tag++) $channel->ack($tag);
-        self::assertNull(self::privateValue($channel, 'callbackDeliveryTag'));
-        self::assertFalse((bool) self::privateValue($channel, 'callbackSettled'));
+        $state = self::privateValue($channel, 'state');
+        self::assertNull(self::privateValue($state, 'callbackDeliveryTag'));
+        self::assertFalse((bool) self::privateValue($state, 'callbackSettled'));
     }
     public function testBlockingConsumeCannotBeMixedWithSubscriptions(): void
     {
@@ -771,7 +772,8 @@ final class ClientTest extends TestCase
             $channel->subscribe('jobs', static fn (): null => null, 'subscription');
             Coroutine::create(function () use ($channel): void { try { $channel->wait(); } catch (\Throwable) {} });
             $deadline = microtime(true) + 0.2;
-            while (!self::privateValue($channel, 'subscriptionWaitActive') && microtime(true) < $deadline) Coroutine::sleep(0.001);
+            $state = self::privateValue($channel, 'state');
+            while (!self::privateValue($state, 'subscriptionWaitActive') && microtime(true) < $deadline) Coroutine::sleep(0.001);
             try { $channel->wait(); }
             catch (\LogicException) { $rejected = true; }
             $client->close();
