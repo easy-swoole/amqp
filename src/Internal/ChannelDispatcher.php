@@ -29,7 +29,7 @@ final class ChannelDispatcher
     }
 
     /** @return array{int, int, Reader} */
-    public function readMethod(bool $closeOnTimeout = true, bool $bufferDeliveries = true, bool $returnCancellation = false): array
+    public function readMethod(bool $closeOnTimeout = true): array
     {
         $deferredNack = null;
         while (true) {
@@ -41,11 +41,9 @@ final class ChannelDispatcher
                     if ($event->negative) $deferredNack = $this->publisherNack();
                     continue 2;
                 case InboundEvent::DELIVERY:
-                    if (!$bufferDeliveries) break;
                     $this->bufferDelivery($event);
                     continue 2;
                 case InboundEvent::CANCELLATION:
-                    if ($returnCancellation) return [$event->classId, $event->methodId, new Reader('')];
                     $this->bufferCancellation($event);
                     continue 2;
             }

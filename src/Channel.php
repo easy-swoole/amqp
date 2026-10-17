@@ -241,7 +241,7 @@ final class Channel
                         $this->connection->abort();
                         throw new ProtocolException("Consumer event references unexpected tag {$eventTag}; expected {$tag}.");
                     }
-                    if ($event['type'] === 'cancel') { $this->state->cancelRequested = false; return null; }
+                    if ($event['type'] === 'cancel') return null;
                     return $event['value'];
                 });
             } catch (TimeoutException $error) {
@@ -325,7 +325,6 @@ final class Channel
     {
         $this->operation(function () use ($consumerTag): void {
             $this->connection->send(Frame::method($this->id, Protocol::BASIC, 30, (new Writer())->shortstr($consumerTag)->bit(false)->bytes()));
-            $this->state->cancelRequested = true;
         });
     }
     public function ack(int $deliveryTag, bool $multiple = false): void { $this->sendAck(80, $deliveryTag, $multiple, null); }

@@ -13,7 +13,6 @@ final class ChannelState
     public bool $transactional = false;
     public bool $legacyConsumerActive = false;
     public bool $subscriptionWaitActive = false;
-    public bool $cancelRequested = false;
     public ?ProtocolException $asynchronousCloseError = null;
     private ?int $callbackDeliveryTag = null;
     private bool $callbackSettled = false;
@@ -33,7 +32,6 @@ final class ChannelState
         $this->transactional = false;
         $this->legacyConsumerActive = false;
         $this->subscriptionWaitActive = false;
-        $this->cancelRequested = false;
         $this->asynchronousCloseError = null;
         $this->endDelivery();
     }

@@ -6,6 +6,7 @@ namespace EasySwoole\AMQP;
 final class Subscription
 {
     private bool $active = true;
+    private bool $cancelling = false;
     public function __construct(
         private ?Channel $channel,
         public readonly string $consumerTag,
@@ -15,7 +16,10 @@ final class Subscription
 
     public function cancel(): void
     {
-        if ($this->active) $this->channel?->cancel($this->consumerTag);
+        if (!$this->active || $this->cancelling || $this->channel === null) return;
+        $this->cancelling = true;
+        try { $this->channel->cancel($this->consumerTag); }
+        catch (\Throwable $error) { $this->cancelling = false; throw $error; }
     }
     public function isActive(): bool { return $this->active; }
     public function dispatch(Message $message): mixed
@@ -26,6 +30,7 @@ final class Subscription
     public function markCancelled(): void
     {
         $this->active = false;
+        $this->cancelling = false;
         $this->handler = null;
         $this->channel = null;
     }

@@ -7,6 +7,7 @@ use EasySwoole\AMQP\AMQP;
 use EasySwoole\AMQP\Config;
 use EasySwoole\AMQP\Connection;
 use EasySwoole\AMQP\Message;
+use EasySwoole\AMQP\Protocol;
 use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Exception\TimeoutException;
@@ -606,7 +607,7 @@ final class ClientTest extends TestCase
             . (new Frame(Frame::HEADER, 1, $header))->encode()
             . (new Frame(Frame::BODY, 1, 'first'))->encode()
             . ServerFrames::method(1, 85, 11)
-            . ServerFrames::method(1, 60, 30, (new Writer())->shortstr('consumer')->bytes())
+            . ServerFrames::method(1, 60, 30, (new Writer())->shortstr('consumer')->bit(false)->bytes())
             . ServerFrames::method(1, 60, 80, (new Writer())->longlong(1)->bit(false)->bytes());
         $transport = new MemoryTransport($incoming);
         $channel = (new AMQP(new Config(), $transport))->channel();
@@ -621,6 +622,42 @@ final class ClientTest extends TestCase
             array_values(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::METHOD)),
         );
         self::assertContains([60, 31], $methods);
+    }
+    public function testServerCancelWithNoWaitDoesNotSendCancelOk(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('consumer')->bytes())
+            . ServerFrames::method(1, 60, 30, (new Writer())->shortstr('consumer')->bit(true)->bytes());
+        $transport = new MemoryTransport($incoming);
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        self::assertSame('consumer', $channel->consume('jobs', static fn (): null => null, 'consumer', autoAck: true));
+        $cancelOk = array_filter(
+            self::writtenFrames($transport->written),
+            static fn (Frame $frame): bool => $frame->type === Frame::METHOD
+                && array_slice($frame->methodParts(), 0, 2) === [Protocol::BASIC, 31],
+        );
+        self::assertCount(0, $cancelOk);
+    }
+    public function testSubscriptionCancelIsIdempotentWhileAwaitingBrokerReply(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('consumer')->bytes())
+            . ServerFrames::method(1, 60, 31, (new Writer())->shortstr('consumer')->bytes());
+        $transport = new MemoryTransport($incoming);
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        $subscription = $channel->subscribe('jobs', static fn (): null => null, 'consumer');
+        $subscription->cancel();
+        $subscription->cancel();
+        $channel->wait();
+        $cancels = array_filter(
+            self::writtenFrames($transport->written),
+            static fn (Frame $frame): bool => $frame->type === Frame::METHOD
+                && array_slice($frame->methodParts(), 0, 2) === [Protocol::BASIC, 30],
+        );
+        self::assertCount(1, $cancels);
+        self::assertFalse($subscription->isActive());
     }
     public function testHeartbeatYieldsConsumerReadWithoutClosingConnection(): void
     {

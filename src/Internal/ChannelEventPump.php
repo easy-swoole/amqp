@@ -50,7 +50,8 @@ final class ChannelEventPump
         }
         if ($class === Protocol::BASIC && in_array($method, [30, 31], true)) {
             $consumerTag = $reader->shortstr();
-            if ($method === 30) {
+            $noWait = $method === 30 && $reader->bit();
+            if ($method === 30 && !$noWait) {
                 $this->connection->send(Frame::method(
                     $this->channelId,
                     Protocol::BASIC,
