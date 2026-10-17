@@ -8,14 +8,16 @@ use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Message;
 use EasySwoole\AMQP\Protocol;
 use EasySwoole\AMQP\ReturnedMessage;
+use EasySwoole\AMQP\Wire\Frame;
 use EasySwoole\AMQP\Wire\Reader;
+use EasySwoole\AMQP\Wire\Writer;
 
 final class ChannelDispatcher
 {
     /** @var list<ReturnedMessage> */
     private array $returns = [];
-    /** @var list<Message> */
-    private array $deliveries = [];
+    /** @var list<array{type:'delivery'|'cancel', value:Message|string}> */
+    private array $consumerEvents = [];
 
     public function __construct(
         private readonly Connection $connection,
@@ -25,7 +27,7 @@ final class ChannelDispatcher
     ) {}
 
     /** @return array{int, int, Reader} */
-    public function readMethod(bool $closeOnTimeout = true, bool $bufferDeliveries = true): array
+    public function readMethod(bool $closeOnTimeout = true, bool $bufferDeliveries = true, bool $returnCancellation = false): array
     {
         while (true) {
             [$class, $method, $reader] = $this->connection->readMethod($this->channelId, $closeOnTimeout);
@@ -39,7 +41,21 @@ final class ChannelDispatcher
                 continue;
             }
             if ($bufferDeliveries && $class === Protocol::BASIC && $method === Protocol::BASIC_DELIVER) {
-                $this->deliveries[] = $this->readDelivery($reader);
+                $this->consumerEvents[] = ['type'=>'delivery', 'value'=>$this->readDelivery($reader)];
+                continue;
+            }
+            if ($class === Protocol::BASIC && in_array($method, [30, 31], true)) {
+                $consumerTag = $reader->shortstr();
+                if ($method === 30) {
+                    $this->connection->send(Frame::method(
+                        $this->channelId,
+                        Protocol::BASIC,
+                        31,
+                        (new Writer())->shortstr($consumerTag)->bytes(),
+                    ));
+                }
+                if ($returnCancellation) return [$class, $method, new Reader('')];
+                $this->consumerEvents[] = ['type'=>'cancel', 'value'=>$consumerTag];
                 continue;
             }
             return [$class, $method, $reader];
@@ -58,7 +74,20 @@ final class ChannelDispatcher
                 continue;
             }
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_DELIVER) {
-                $this->deliveries[] = $this->readDelivery($reader);
+                $this->consumerEvents[] = ['type'=>'delivery', 'value'=>$this->readDelivery($reader)];
+                continue;
+            }
+            if ($class === Protocol::BASIC && in_array($method, [30, 31], true)) {
+                $consumerTag = $reader->shortstr();
+                if ($method === 30) {
+                    $this->connection->send(Frame::method(
+                        $this->channelId,
+                        Protocol::BASIC,
+                        31,
+                        (new Writer())->shortstr($consumerTag)->bytes(),
+                    ));
+                }
+                $this->consumerEvents[] = ['type'=>'cancel', 'value'=>$consumerTag];
                 continue;
             }
             if ($class !== Protocol::BASIC || !in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
@@ -71,8 +100,9 @@ final class ChannelDispatcher
     }
 
     public function popReturn(): ?ReturnedMessage { return array_shift($this->returns); }
-    public function popDelivery(): ?Message { return array_shift($this->deliveries); }
-    public function clear(): void { $this->returns = []; $this->deliveries = []; }
+    /** @return null|array{type:'delivery'|'cancel', value:Message|string} */
+    public function popConsumerEvent(): ?array { return array_shift($this->consumerEvents); }
+    public function clear(): void { $this->returns = []; $this->consumerEvents = []; }
 
     private function applyConfirmation(Reader $reader): void
     {

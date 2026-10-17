@@ -34,6 +34,29 @@ final class ClientTest extends TestCase
         $methods = self::writtenFrames($transport->written);
         self::assertSame([[10,11],[10,31],[10,40],[20,10],[50,10]], array_map(fn (Frame $f) => array_slice($f->methodParts(), 0, 2), $methods));
     }
+    public function testAdditionalExchangeQueueAndRecoverMethods(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 40, 31)
+            . ServerFrames::method(1, 40, 51)
+            . ServerFrames::method(1, 50, 51)
+            . ServerFrames::method(1, 50, 31, (new Writer())->long(7)->bytes())
+            . ServerFrames::method(1, 60, 111);
+        $transport = new MemoryTransport($incoming);
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        $channel->exchangeBind('destination', 'source', 'route', ['x'=>1]);
+        $channel->exchangeUnbind('destination', 'source', 'route', ['x'=>1]);
+        $channel->queueUnbind('jobs', 'events', 'route', ['x'=>1]);
+        self::assertSame(7, $channel->queuePurge('jobs'));
+        $channel->recover();
+        $channel->recoverAsync(false);
+        $methods = array_map(
+            fn (Frame $frame) => array_slice($frame->methodParts(), 0, 2),
+            array_values(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::METHOD)),
+        );
+        self::assertSame([[40,30],[40,40],[50,50],[50,30],[60,110],[60,100]], array_slice($methods, -6));
+    }
     public function testPublishFramesBodyAndProperties(): void
     {
         $transport = new MemoryTransport(ServerFrames::handshake(4096) . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
@@ -237,6 +260,24 @@ final class ClientTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $channel->get('jobs', timeout: 0);
     }
+    public function testExplicitDeadlineOverridesShorterQueueWriteTimeout(): void
+    {
+        $completed = false;
+        Coroutine\run(function () use (&$completed): void {
+            $connection = new Connection(
+                new Config(connectTimeout: 0.05, readTimeout: 0.05, writeTimeout: 0.05),
+                new MemoryTransport(),
+            );
+            $started = new Coroutine\Channel(1);
+            Coroutine::create(function () use ($connection, $started): void {
+                $connection->execute(function () use ($started): void { $started->push(true); Coroutine::sleep(0.1); }, 0.2);
+            });
+            $started->pop(0.2);
+            $completed = $connection->execute(static fn (): bool => true, 0.2);
+            $connection->close();
+        });
+        self::assertTrue($completed);
+    }
     public function testPublicBlockingOperationsDefaultToThreeSecondDeadline(): void
     {
         $get = new \ReflectionMethod(\EasySwoole\AMQP\Channel::class, 'get');
@@ -308,6 +349,33 @@ final class ClientTest extends TestCase
             else $sameChannel->cancel('consumer');
         }, 'consumer', autoAck: true);
         self::assertSame(['first', 'second'], $received);
+    }
+    public function testServerCancelInterleavedWithPublisherConfirmStopsConsumerCleanly(): void
+    {
+        $delivery = (new Writer())->shortstr('consumer')->longlong(1)->bit(false)->shortstr('')->shortstr('jobs')->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(5)->raw(pack('n', 0))->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('consumer')->bytes())
+            . ServerFrames::method(1, 60, 60, $delivery)
+            . (new Frame(Frame::HEADER, 1, $header))->encode()
+            . (new Frame(Frame::BODY, 1, 'first'))->encode()
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 30, (new Writer())->shortstr('consumer')->bytes())
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(1)->bit(false)->bytes());
+        $transport = new MemoryTransport($incoming);
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        $received = [];
+        $channel->consume('jobs', function (Message $message, $sameChannel) use (&$received): void {
+            $received[] = $message->body;
+            $sameChannel->publishConfirmed('reply');
+        }, 'consumer', autoAck: true);
+        self::assertSame(['first'], $received);
+        $methods = array_map(
+            fn (Frame $frame) => array_slice($frame->methodParts(), 0, 2),
+            array_values(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::METHOD)),
+        );
+        self::assertContains([60, 31], $methods);
     }
     public function testConnectionCanReconnectAfterTransportWasClosed(): void
     {

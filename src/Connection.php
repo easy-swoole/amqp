@@ -136,7 +136,7 @@ final class Connection
         $reply = new CoroutineChannel(1);
         $state = (object) ['cancelled'=>false, 'started'=>false];
         $startedAt = microtime(true);
-        $enqueueTimeout = $timeout === null || $timeout === -1.0 ? $this->config->writeTimeout : min($this->config->writeTimeout, $timeout);
+        $enqueueTimeout = $timeout ?? $this->config->writeTimeout;
         if (!$this->operations?->push(['operation'=>$operation, 'reply'=>$reply, 'state'=>$state], $enqueueTimeout)) {
             throw new TimeoutException('AMQP operation timed out while waiting for the I/O worker.');
         }

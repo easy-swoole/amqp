@@ -61,6 +61,34 @@ final class Channel
             $this->rpc(50, 20, $args, 50, 21);
         });
     }
+    public function exchangeBind(string $destination, string $source, string $routingKey = '', array $arguments = []): void
+    {
+        $this->operation(function () use ($destination, $source, $routingKey, $arguments): void {
+            $args = (new Writer())->short(0)->shortstr($destination)->shortstr($source)->shortstr($routingKey)->bit(false)->table($arguments)->bytes();
+            $this->rpc(Protocol::EXCHANGE, 30, $args, Protocol::EXCHANGE, 31);
+        });
+    }
+    public function exchangeUnbind(string $destination, string $source, string $routingKey = '', array $arguments = []): void
+    {
+        $this->operation(function () use ($destination, $source, $routingKey, $arguments): void {
+            $args = (new Writer())->short(0)->shortstr($destination)->shortstr($source)->shortstr($routingKey)->bit(false)->table($arguments)->bytes();
+            $this->rpc(Protocol::EXCHANGE, 40, $args, Protocol::EXCHANGE, 51);
+        });
+    }
+    public function queueUnbind(string $queue, string $exchange, string $routingKey = '', array $arguments = []): void
+    {
+        $this->operation(function () use ($queue, $exchange, $routingKey, $arguments): void {
+            $args = (new Writer())->short(0)->shortstr($queue)->shortstr($exchange)->shortstr($routingKey)->table($arguments)->bytes();
+            $this->rpc(Protocol::QUEUE, 50, $args, Protocol::QUEUE, 51);
+        });
+    }
+    public function queuePurge(string $queue): int
+    {
+        return $this->operation(function () use ($queue): int {
+            $args = (new Writer())->short(0)->shortstr($queue)->bit(false)->bytes();
+            return $this->rpc(Protocol::QUEUE, 30, $args, Protocol::QUEUE, 31)->long();
+        });
+    }
     public function exchangeDelete(string $exchange, bool $ifUnused = false): void
     {
         $this->operation(function () use ($exchange, $ifUnused): void {
@@ -142,15 +170,14 @@ final class Channel
         while ($this->open) {
             try {
                 $message = $this->operation(function (): ?Message {
-                $queued = $this->dispatcher->popDelivery();
-                if ($queued !== null) return $queued;
-                [$class, $method, $delivery] = $this->dispatcher->readMethod(false, false);
-                if ($class === 60 && $method === 30) {
-                    $cancelledTag = $delivery->shortstr();
-                    $this->connection->send(Frame::method($this->id, 60, 31, (new Writer())->shortstr($cancelledTag)->bytes()));
+                $queued = $this->dispatcher->popConsumerEvent();
+                if ($queued !== null) {
+                    if ($queued['type'] === 'delivery') return $queued['value'];
+                    $this->cancelRequested = false;
                     return null;
                 }
-                if ($class === 60 && $method === 31 && $this->cancelRequested) { $this->cancelRequested = false; return null; }
+                [$class, $method, $delivery] = $this->dispatcher->readMethod(false, false, true);
+                if ($class === 60 && in_array($method, [30, 31], true)) { $this->cancelRequested = false; return null; }
                 if ($class !== 60 || $method !== 60) throw new ProtocolException('Expected basic.deliver.');
                 $consumer = $delivery->shortstr(); $deliveryTag = $delivery->longlong(); $redelivered = $delivery->bit(); $exchange = $delivery->shortstr(); $routingKey = $delivery->shortstr();
                 return $this->contentReader->read($deliveryTag, $redelivered, $exchange, $routingKey, $consumer);
@@ -189,6 +216,14 @@ final class Channel
             $this->connection->send(Frame::method($this->id, 60, 90, (new Writer())->longlong($deliveryTag)->bit($requeue)->bytes()));
             $this->settled[$deliveryTag] = true;
         });
+    }
+    public function recover(bool $requeue = true): void
+    {
+        $this->operation(fn () => $this->rpc(Protocol::BASIC, 110, (new Writer())->bit($requeue)->bytes(), Protocol::BASIC, 111));
+    }
+    public function recoverAsync(bool $requeue = true): void
+    {
+        $this->operation(fn () => $this->connection->send(Frame::method($this->id, Protocol::BASIC, 100, (new Writer())->bit($requeue)->bytes())));
     }
     public function close(): void
     {
