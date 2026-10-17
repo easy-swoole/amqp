@@ -1,0 +1,269 @@
+<?php
+declare(strict_types=1);
+
+namespace EasySwoole\AMQP\Tests;
+
+use EasySwoole\AMQP\AMQP;
+use EasySwoole\AMQP\Config;
+use EasySwoole\AMQP\Connection;
+use EasySwoole\AMQP\Exception\ProtocolException;
+use EasySwoole\AMQP\Tests\Support\MemoryTransport;
+use EasySwoole\AMQP\Tests\Support\ServerFrames;
+use EasySwoole\AMQP\Wire\Frame;
+use EasySwoole\AMQP\Wire\Reader;
+use EasySwoole\AMQP\Wire\Writer;
+use PHPUnit\Framework\TestCase;
+use Swoole\Coroutine;
+use Swoole\Timer;
+
+final class ClientTest extends TestCase
+{
+    public function testHandshakeAndQueueDeclaration(): void
+    {
+        $declared = (new Writer())->shortstr('jobs')->long(4)->long(2)->bytes();
+        $transport = new MemoryTransport(ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()) . ServerFrames::method(1, 50, 11, $declared));
+        $client = new AMQP(new Config(), $transport); $channel = $client->channel();
+        self::assertSame(['queue'=>'jobs','messageCount'=>4,'consumerCount'=>2], $channel->queueDeclare('jobs', durable: true));
+        self::assertTrue($client->isConnected()); self::assertStringStartsWith("AMQP\x00\x00\x09\x01", $transport->written);
+        $methods = self::writtenFrames($transport->written);
+        self::assertSame([[10,11],[10,31],[10,40],[20,10],[50,10]], array_map(fn (Frame $f) => array_slice($f->methodParts(), 0, 2), $methods));
+    }
+    public function testPublishFramesBodyAndProperties(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake(4096) . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
+        $channel = (new AMQP(new Config(frameMax: 4096), $transport))->channel();
+        $channel->publish('hello', 'events', 'created', ['content_type'=>'application/json','delivery_mode'=>2]);
+        $frames = self::writtenFrames($transport->written); $tail = array_slice($frames, -3);
+        self::assertSame([Frame::METHOD, Frame::HEADER, Frame::BODY], array_column($tail, 'type'));
+        self::assertSame('hello', $tail[2]->payload);
+        $method = new Reader($tail[0]->payload); self::assertSame(60, $method->short()); self::assertSame(40, $method->short()); $method->short();
+        self::assertSame('events', $method->shortstr()); self::assertSame('created', $method->shortstr());
+    }
+    public function testLargeBodyIsSplitAtNegotiatedFrameLimit(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake(4096) . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
+        $channel = (new AMQP(new Config(frameMax: 4096), $transport))->channel();
+        $channel->publish(str_repeat('x', 9000));
+        $bodyFrames = array_values(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::BODY));
+        self::assertSame([4088, 4088, 824], array_map(fn (Frame $frame) => strlen($frame->payload), $bodyFrames));
+    }
+    public function testEmptyGetReturnsNull(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 72, (new Writer())->shortstr('')->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        self::assertNull($channel->get('empty'));
+    }
+    public function testBasicGetBuildsMessageAndAck(): void
+    {
+        $get = (new Writer())->longlong(42)->bit(false)->shortstr('')->shortstr('jobs')->long(0)->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(4)->raw(pack('n', 1 << 15))->shortstr('text/plain')->bytes();
+        $incoming = ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 71, $get) . (new Frame(Frame::HEADER, 1, $header))->encode() . (new Frame(Frame::BODY, 1, 'test'))->encode();
+        $transport = new MemoryTransport($incoming); $channel = (new AMQP(new Config(), $transport))->channel(); $message = $channel->get('jobs');
+        self::assertNotNull($message); self::assertSame('test', $message->body); self::assertSame(42, $message->deliveryTag); self::assertSame('text/plain', $message->properties['content_type']);
+        $channel->ack($message->deliveryTag); $frames = self::writtenFrames($transport->written); self::assertSame([60,80], array_slice(end($frames)->methodParts(), 0, 2));
+    }
+    public function testConnectionCanReconnectAfterTransportWasClosed(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake()); $client = new AMQP(new Config(), $transport); $client->connect();
+        $transport->close(); $transport->incoming .= ServerFrames::handshake();
+        $client->connect(); self::assertTrue($client->isConnected());
+    }
+    public function testReconnectInvalidatesChannelsFromPreviousConnection(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
+        $client = new AMQP(new Config(), $transport);
+        $oldChannel = $client->channel(1);
+        $transport->close(); $transport->incoming .= ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes());
+        $client->connect();
+        $newChannel = $client->channel(1);
+        self::assertSame(1, $newChannel->id);
+        $this->expectException(\LogicException::class);
+        $oldChannel->publish('must not be sent');
+    }
+    public function testFramesForAnotherChannelAreBuffered(): void
+    {
+        $openOk = (new Writer())->longstr('')->bytes();
+        $queueOne = (new Writer())->shortstr('one')->long(0)->long(0)->bytes();
+        $queueTwo = (new Writer())->shortstr('two')->long(0)->long(0)->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, $openOk)
+            . ServerFrames::method(2, 20, 11, $openOk)
+            . ServerFrames::method(0, 10, 60, (new Writer())->shortstr('low disk')->bytes())
+            . ServerFrames::method(2, 50, 11, $queueTwo)
+            . ServerFrames::method(1, 50, 11, $queueOne);
+        $client = new AMQP(new Config(), new MemoryTransport($incoming)); $first = $client->channel(1); $second = $client->channel(2);
+        self::assertSame('one', $first->queueDeclare('one')['queue']);
+        self::assertSame('two', $second->queueDeclare('two')['queue']);
+        self::assertSame('low disk', $client->blockedReason());
+    }
+    public function testChannelCloseFromBrokerReleasesIdForReuse(): void
+    {
+        $close = (new Writer())->short(404)->shortstr('missing')->short(50)->short(10)->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 20, 40, $close)
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes());
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel(1);
+        try { $channel->queueDeclare('missing', passive: true); self::fail('Expected broker channel.close.'); }
+        catch (ProtocolException $error) { self::assertSame(404, $error->replyCode); }
+        self::assertSame(1, $client->channel(1)->id);
+    }
+    public function testChannelIdNeverExceedsProtocolFieldWidth(): void
+    {
+        $client = new AMQP(new Config(channelMax: 0), new MemoryTransport(ServerFrames::handshake(channelMax: 0)));
+        $client->connect();
+        $this->expectException(\InvalidArgumentException::class);
+        $client->channel(65536);
+    }
+    public function testMandatoryPublishFailsBeforeWritingFrames(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        $before = strlen($transport->written);
+        try { $channel->publish('body', mandatory: true); self::fail('Expected unsupported mandatory publish exception.'); }
+        catch (\LogicException) { self::assertSame($before, strlen($transport->written)); }
+    }
+    public function testOperationsFromDifferentCoroutinesAreSerializedByWorker(): void
+    {
+        $result = []; $error = null;
+        Coroutine\run(function () use (&$result, &$error): void {
+            try {
+                $reply = fn (string $name) => (new Writer())->shortstr($name)->long(0)->long(0)->bytes();
+                $incoming = ServerFrames::handshake()
+                    . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+                    . ServerFrames::method(1, 50, 11, $reply('first'))
+                    . ServerFrames::method(1, 50, 11, $reply('second'));
+                $client = new AMQP(new Config(), new MemoryTransport($incoming));
+                $channel = $client->channel();
+                $done = new Coroutine\Channel(2);
+                foreach (['first', 'second'] as $name) {
+                    Coroutine::create(function () use ($channel, $done, $name, &$result): void {
+                        $result[] = $channel->queueDeclare($name)['queue'];
+                        $done->push(true);
+                    });
+                }
+                $done->pop(1); $done->pop(1);
+                $client->close();
+            } catch (\Throwable $throwable) { $error = $throwable; }
+        });
+        if ($error !== null) throw $error;
+        self::assertSame(['first', 'second'], $result);
+    }
+    public function testQueuedOperationIsSkippedAfterCallerTimesOut(): void
+    {
+        $executed = 0; $timeouts = 0;
+        Coroutine\run(function () use (&$executed, &$timeouts): void {
+            $connection = new Connection(new Config(connectTimeout: 0.05, readTimeout: 0.05, writeTimeout: 0.05), new MemoryTransport());
+            Coroutine::create(function () use ($connection, &$timeouts): void {
+                try { $connection->execute(fn () => Coroutine::sleep(1.2)); }
+                catch (\RuntimeException) { $timeouts++; }
+            });
+            Coroutine::sleep(0.01);
+            Coroutine::create(function () use ($connection, &$executed, &$timeouts): void {
+                try { $connection->execute(function () use (&$executed): void { $executed++; }); }
+                catch (\RuntimeException) { $timeouts++; }
+            });
+            Coroutine::sleep(1.4);
+            unset($connection);
+            gc_collect_cycles();
+        });
+        self::assertSame(2, $timeouts);
+        self::assertSame(0, $executed);
+    }
+    public function testHeartbeatTimerStopsWhenClientCloses(): void
+    {
+        $heartbeatFrames = 0; $writesAfterClose = -1; $writesLater = -2; $error = null;
+        Coroutine\run(function () use (&$heartbeatFrames, &$writesAfterClose, &$writesLater, &$error): void {
+            try {
+                $transport = new MemoryTransport(ServerFrames::handshake(131072, 1));
+                $client = new AMQP(new Config(heartbeat: 1), $transport);
+                $client->connect();
+                Coroutine::sleep(1.1);
+                $heartbeatFrames = count(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::HEARTBEAT));
+                $client->close();
+                $writesAfterClose = strlen($transport->written);
+                Coroutine::sleep(1.1);
+                $writesLater = strlen($transport->written);
+            } catch (\Throwable $throwable) { $error = $throwable; }
+        });
+        if ($error !== null) throw $error;
+        self::assertGreaterThanOrEqual(1, $heartbeatFrames);
+        self::assertSame($writesAfterClose, $writesLater);
+    }
+    public function testDestructorStopsHeartbeatTimer(): void
+    {
+        $writesAfterDestroy = -1; $writesLater = -2;
+        Coroutine\run(function () use (&$writesAfterDestroy, &$writesLater): void {
+            $transport = new MemoryTransport(ServerFrames::handshake(131072, 1));
+            $client = new AMQP(new Config(heartbeat: 1), $transport);
+            $client->connect();
+            unset($client);
+            gc_collect_cycles();
+            $writesAfterDestroy = strlen($transport->written);
+            Coroutine::sleep(1.1);
+            $writesLater = strlen($transport->written);
+        });
+        self::assertSame($writesAfterDestroy, $writesLater);
+    }
+    public function testWorkerAndHeartbeatTimerAreNotDuplicated(): void
+    {
+        $error = null;
+        Coroutine\run(function () use (&$error): void {
+            try {
+                $transport = new MemoryTransport(ServerFrames::handshake(heartbeat: 1));
+                $client = new AMQP(new Config(heartbeat: 1), $transport);
+                $connection = self::connectionOf($client);
+                $done = new Coroutine\Channel(8);
+                for ($index = 0; $index < 8; $index++) Coroutine::create(function () use ($client, $done): void { $client->connect(); $done->push(true); });
+                for ($index = 0; $index < 8; $index++) $done->pop(1);
+
+                $worker = self::privateValue($connection, 'workerCid');
+                $timer = self::privateValue($connection, 'heartbeatTimerId');
+                self::assertIsInt($worker); self::assertIsInt($timer); self::assertTrue(Timer::exists($timer));
+                $client->connect();
+                self::assertSame($worker, self::privateValue($connection, 'workerCid'));
+                self::assertSame($timer, self::privateValue($connection, 'heartbeatTimerId'));
+
+                $transport->close();
+                $transport->incoming .= ServerFrames::handshake(heartbeat: 1);
+                $client->connect();
+                $replacementTimer = self::privateValue($connection, 'heartbeatTimerId');
+                self::assertSame($worker, self::privateValue($connection, 'workerCid'));
+                self::assertNotSame($timer, $replacementTimer);
+                self::assertFalse(Timer::exists($timer)); self::assertTrue(Timer::exists($replacementTimer));
+
+                $client->close();
+                self::assertFalse((bool) self::privateValue($connection, 'workerRunning'));
+                self::assertNull(self::privateValue($connection, 'heartbeatTimerId'));
+
+                $transport->incoming .= ServerFrames::handshake(heartbeat: 1);
+                $client->connect();
+                $newWorker = self::privateValue($connection, 'workerCid');
+                $newTimer = self::privateValue($connection, 'heartbeatTimerId');
+                self::assertIsInt($newWorker); self::assertNotSame($worker, $newWorker);
+                self::assertIsInt($newTimer); self::assertTrue(Timer::exists($newTimer));
+                $client->connect();
+                self::assertSame($newWorker, self::privateValue($connection, 'workerCid'));
+                self::assertSame($newTimer, self::privateValue($connection, 'heartbeatTimerId'));
+                $client->close();
+            } catch (\Throwable $throwable) { $error = $throwable; }
+        });
+        if ($error !== null) throw $error;
+    }
+    /** @return list<Frame> */
+    private static function writtenFrames(string $bytes): array
+    {
+        $bytes = substr($bytes, 8); $offset = 0; $frames = [];
+        while ($offset < strlen($bytes)) $frames[] = Frame::read(function (int $length) use (&$offset, $bytes): string { $part = substr($bytes, $offset, $length); $offset += $length; return $part; });
+        return $frames;
+    }
+    private static function connectionOf(AMQP $client): Connection { return self::privateValue($client, 'connection'); }
+    private static function privateValue(object $object, string $property): mixed
+    {
+        return (new \ReflectionProperty($object, $property))->getValue($object);
+    }
+}
