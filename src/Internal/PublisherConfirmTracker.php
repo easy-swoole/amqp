@@ -30,7 +30,8 @@ final class PublisherConfirmTracker
         foreach ($this->pending as $sequence => $_) if ($sequence <= $target) return true;
         return false;
     }
-    public function apply(Reader $reader): void
+    /** @return list<int> */
+    public function apply(Reader $reader): array
     {
         $deliveryTag = $reader->longlong();
         $multiple = $reader->bit();
@@ -38,12 +39,15 @@ final class PublisherConfirmTracker
             throw new ProtocolException("Publisher confirmation references unknown delivery tag {$deliveryTag}.");
         }
         $matched = false;
+        $settled = [];
         foreach (array_keys($this->pending) as $sequence) {
             if (($multiple && ($deliveryTag === 0 || $sequence <= $deliveryTag)) || (!$multiple && $sequence === $deliveryTag)) {
                 unset($this->pending[$sequence]);
                 $matched = true;
+                $settled[] = $sequence;
             }
         }
         if (!$matched) throw new ProtocolException("Publisher confirmation references settled delivery tag {$deliveryTag}.");
+        return $settled;
     }
 }

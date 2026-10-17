@@ -5,7 +5,10 @@ namespace EasySwoole\AMQP\Tests;
 
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Wire\Frame;
+use EasySwoole\AMQP\Wire\IntegerValue;
 use EasySwoole\AMQP\Wire\BasicProperties;
+use EasySwoole\AMQP\Wire\ByteArray;
+use EasySwoole\AMQP\Wire\Decimal;
 use EasySwoole\AMQP\Wire\Reader;
 use EasySwoole\AMQP\Wire\Writer;
 use PHPUnit\Framework\TestCase;
@@ -45,6 +48,42 @@ final class WireTest extends TestCase
     {
         $encoded = (new Writer())->longstr((new Writer())->shortstr('negative')->raw('s')->raw(pack('n', 0xffff))->bytes())->bytes();
         self::assertSame(['negative'=>-1], (new Reader($encoded))->table());
+    }
+    public function testDecimalTimestampAndByteArrayFieldValuesRoundTrip(): void
+    {
+        $timestamp = new \DateTimeImmutable('@1700000000');
+        $table = (new Reader((new Writer())->table([
+            'price'=>new Decimal(-12345, 2),
+            'created'=>$timestamp,
+            'binary'=>new ByteArray("\x00\xff"),
+        ])->bytes()))->table();
+        self::assertEquals(new Decimal(-12345, 2), $table['price']);
+        self::assertSame(1700000000, $table['created']);
+        self::assertSame("\x00\xff", $table['binary']);
+    }
+    public function testExplicitIntegerWireTypesRoundTrip(): void
+    {
+        $values = [
+            'i8'=>new IntegerValue(-128, 'b'), 'u8'=>new IntegerValue(255, 'B'),
+            'i16'=>new IntegerValue(-32768, 'U'), 'u16'=>new IntegerValue(65535, 'u'),
+            'i32'=>new IntegerValue(-2147483648, 'I'), 'u32'=>new IntegerValue(4294967295, 'i'),
+            'i64'=>new IntegerValue(-5000000000, 'L'), 'u64'=>new IntegerValue(5000000000, 'l'),
+        ];
+        $decoded = (new Reader((new Writer())->table($values)->bytes()))->table();
+        self::assertSame([
+            'i8'=>-128, 'u8'=>255, 'i16'=>-32768, 'u16'=>65535,
+            'i32'=>-2147483648, 'u32'=>4294967295, 'i64'=>-5000000000, 'u64'=>5000000000,
+        ], $decoded);
+    }
+    public function testExplicitIntegerWireTypeValidatesRange(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new IntegerValue(256, 'B');
+    }
+    public function testUnsignedLongLongRejectsNegativeValues(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new IntegerValue(-1, 'l');
     }
     public function testNullBasicPropertiesAreOmitted(): void
     {

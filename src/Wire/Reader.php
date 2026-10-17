@@ -51,13 +51,15 @@ final class Reader
         return match ($type) {
             'S', 'x' => $this->longstr(), 't' => (bool) $this->octet(),
             'b' => unpack('c', $this->raw(1))[1], 'B' => $this->octet(),
-            's' => self::signed16($this->short()), 'I' => self::signed32($this->long()),
-            'i' => $this->long(), 'l', 'T' => $this->longlong(),
+            's', 'U' => self::signed16($this->short()), 'u' => $this->short(), 'I' => self::signed32($this->long()),
+            'i' => $this->long(), 'L', 'l', 'T' => $this->longlong(),
             'f' => unpack('G', $this->raw(4))[1], 'd' => unpack('E', $this->raw(8))[1],
+            'D' => $this->decimal(),
             'F' => $this->table(), 'A' => $this->array(), 'V' => null,
             default => throw new ProtocolException("Unsupported AMQP field type {$type}."),
         };
     }
     private static function signed16(int $value): int { return $value > 0x7fff ? $value - 0x10000 : $value; }
     private static function signed32(int $value): int { return $value > 0x7fffffff ? $value - 0x100000000 : $value; }
+    private function decimal(): Decimal { $scale = $this->octet(); return new Decimal(self::signed32($this->long()), $scale); }
 }

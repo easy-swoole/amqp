@@ -18,8 +18,12 @@ final class Channel
 {
     private bool $open = false;
     private bool $busy = false;
-    /** @var array<int, true> */
-    private array $settled = [];
+    private ?int $callbackDeliveryTag = null;
+    private bool $callbackSettled = false;
+    /** @var array<string, Subscription> */
+    private array $subscriptions = [];
+    private bool $legacyConsumerActive = false;
+    private bool $subscriptionWaitActive = false;
     private bool $cancelRequested = false;
     /** @var null|callable(ReturnedMessage, Channel):void */
     private $returnHandler = null;
@@ -147,6 +151,10 @@ final class Channel
         }, true, $timeout);
         if ($returned !== null) throw new MessageReturnedException($returned);
     }
+    public function publisherBatch(): PublisherBatch
+    {
+        return new PublisherBatch(fn (array $messages, float $timeout): PublisherConfirmResult => $this->publishBatchMessages($messages, $timeout));
+    }
     public function get(string $queue, bool $autoAck = false, float $timeout = 3.0): ?Message
     {
         return $this->operation(function () use ($queue, $autoAck): ?Message {
@@ -162,6 +170,9 @@ final class Channel
     }
     public function consume(string $queue, callable $handler, string $consumerTag = '', bool $autoAck = false, bool $exclusive = false, array $arguments = []): string
     {
+        if ($this->legacyConsumerActive || $this->subscriptions !== []) throw new \LogicException('This channel already has an active consumer API.');
+        $this->legacyConsumerActive = true;
+        try {
         $tag = $this->operation(function () use ($queue, $consumerTag, $autoAck, $exclusive, $arguments): string {
             $args = (new Writer())->short(0)->shortstr($queue)->shortstr($consumerTag)->bit(false)->bit($autoAck)->bit($exclusive)->bit(false)->table($arguments)->bytes();
             return $this->rpc(60, 20, $args, 60, 21)->shortstr();
@@ -169,18 +180,15 @@ final class Channel
         // 每次只让 I/O worker 读取一条投递，回调仍在调用方协程执行，允许安全 ack/nack。
         while ($this->open) {
             try {
-                $message = $this->operation(function (): ?Message {
-                $queued = $this->dispatcher->popConsumerEvent();
-                if ($queued !== null) {
-                    if ($queued['type'] === 'delivery') return $queued['value'];
-                    $this->cancelRequested = false;
-                    return null;
-                }
-                [$class, $method, $delivery] = $this->dispatcher->readMethod(false, false, true);
-                if ($class === 60 && in_array($method, [30, 31], true)) { $this->cancelRequested = false; return null; }
-                if ($class !== 60 || $method !== 60) throw new ProtocolException('Expected basic.deliver.');
-                $consumer = $delivery->shortstr(); $deliveryTag = $delivery->longlong(); $redelivered = $delivery->bit(); $exchange = $delivery->shortstr(); $routingKey = $delivery->shortstr();
-                return $this->contentReader->read($deliveryTag, $redelivered, $exchange, $routingKey, $consumer);
+                $message = $this->operation(function () use ($tag): ?Message {
+                    $event = $this->dispatcher->nextConsumerEvent();
+                    $eventTag = $event['type'] === 'delivery' ? $event['value']->consumerTag : $event['value'];
+                    if ($eventTag !== $tag) {
+                        $this->connection->abort();
+                        throw new ProtocolException("Consumer event references unexpected tag {$eventTag}; expected {$tag}.");
+                    }
+                    if ($event['type'] === 'cancel') { $this->cancelRequested = false; return null; }
+                    return $event['value'];
                 });
             } catch (TimeoutException $error) {
                 if (!$this->open || !$this->connection->isConnected()) throw $error;
@@ -188,18 +196,75 @@ final class Channel
             }
             if ($message === null) break;
             $deliveryTag = $message->deliveryTag;
+            $this->beginDeliveryCallback($deliveryTag);
             try { $result = $handler($message, $this); }
             catch (\Throwable $error) {
-                if (!$autoAck && $this->open && !isset($this->settled[$deliveryTag])) {
+                if (!$autoAck && $this->open && !$this->callbackSettled) {
                     try { $this->nack($deliveryTag, false, true); }
                     catch (\Throwable $nackError) { throw new \RuntimeException('Consumer callback and NACK both failed: ' . $nackError->getMessage(), 0, $error); }
                 }
                 throw $error;
             }
-            if (!$autoAck && $this->open && !isset($this->settled[$deliveryTag])) $result === false ? $this->nack($deliveryTag, false, true) : $this->ack($deliveryTag);
-            unset($this->settled[$deliveryTag]);
+            finally { $settled = $this->callbackSettled; $this->endDeliveryCallback(); }
+            if (!$autoAck && $this->open && !$settled) $result === false ? $this->nack($deliveryTag, false, true) : $this->ack($deliveryTag);
         }
         return $tag;
+        } finally { $this->legacyConsumerActive = false; }
+    }
+    public function subscribe(string $queue, callable $handler, string $consumerTag = '', bool $autoAck = false, bool $exclusive = false, array $arguments = []): Subscription
+    {
+        if ($this->legacyConsumerActive) throw new \LogicException('Cannot subscribe while blocking consume() is active on this channel.');
+        $tag = $this->operation(function () use ($queue, $consumerTag, $autoAck, $exclusive, $arguments): string {
+            $args = (new Writer())->short(0)->shortstr($queue)->shortstr($consumerTag)->bit(false)->bit($autoAck)->bit($exclusive)->bit(false)->table($arguments)->bytes();
+            return $this->rpc(Protocol::BASIC, 20, $args, Protocol::BASIC, 21)->shortstr();
+        });
+        if (isset($this->subscriptions[$tag])) {
+            $this->connection->abort();
+            throw new ProtocolException("Duplicate consumer tag {$tag}.");
+        }
+        return $this->subscriptions[$tag] = new Subscription($this, $tag, \Closure::fromCallable($handler), $autoAck);
+    }
+    public function wait(float $timeout = -1.0): void
+    {
+        if (!is_finite($timeout) || ($timeout <= 0 && $timeout !== -1.0)) throw new \InvalidArgumentException('Wait timeout must be positive seconds or -1.');
+        if ($this->subscriptionWaitActive) throw new \LogicException('A subscription wait loop is already active on this channel.');
+        $this->subscriptionWaitActive = true;
+        try {
+        $deadline = $timeout === -1.0 ? null : microtime(true) + $timeout;
+        while ($this->subscriptions !== []) {
+            $remaining = $deadline === null ? -1.0 : $deadline - microtime(true);
+            if ($remaining !== -1.0 && $remaining <= 0) throw new TimeoutException('Consumer wait deadline exceeded.');
+            try { $event = $this->operation(fn (): array => $this->dispatcher->nextConsumerEvent(), true, $remaining); }
+            catch (TimeoutException $error) {
+                if (!$this->open || !$this->connection->isConnected() || $deadline !== null) throw $error;
+                continue;
+            }
+            $tag = $event['type'] === 'delivery' ? $event['value']->consumerTag : $event['value'];
+            if (!is_string($tag) || !isset($this->subscriptions[$tag])) {
+                $this->connection->abort();
+                throw new ProtocolException("Consumer event references unknown tag {$tag}.");
+            }
+            $subscription = $this->subscriptions[$tag];
+            if ($event['type'] === 'cancel') {
+                $subscription->markCancelled(); unset($this->subscriptions[$tag]); continue;
+            }
+            /** @var Message $message */
+            $message = $event['value'];
+            $this->beginDeliveryCallback($message->deliveryTag);
+            try { $result = $subscription->dispatch($message); }
+            catch (\Throwable $error) {
+                if (!$subscription->autoAck && $this->open && !$this->callbackSettled) {
+                    try { $this->nack($message->deliveryTag, false, true); }
+                    catch (\Throwable $nackError) { throw new \RuntimeException('Consumer callback and NACK both failed: ' . $nackError->getMessage(), 0, $error); }
+                }
+                throw $error;
+            }
+            finally { $settled = $this->callbackSettled; $this->endDeliveryCallback(); }
+            if (!$subscription->autoAck && $this->open && !$settled) {
+                $result === false ? $this->nack($message->deliveryTag, false, true) : $this->ack($message->deliveryTag);
+            }
+        }
+        } finally { $this->subscriptionWaitActive = false; }
     }
     public function cancel(string $consumerTag): void
     {
@@ -214,14 +279,14 @@ final class Channel
     {
         $this->operation(function () use ($deliveryTag, $requeue): void {
             $this->connection->send(Frame::method($this->id, 60, 90, (new Writer())->longlong($deliveryTag)->bit($requeue)->bytes()));
-            $this->settled[$deliveryTag] = true;
+            $this->markCallbackSettled($deliveryTag, false);
         });
     }
-    public function recover(bool $requeue = true): void
+    public function recover(bool $requeue = false): void
     {
         $this->operation(fn () => $this->rpc(Protocol::BASIC, 110, (new Writer())->bit($requeue)->bytes(), Protocol::BASIC, 111));
     }
-    public function recoverAsync(bool $requeue = true): void
+    public function recoverAsync(bool $requeue = false): void
     {
         $this->operation(fn () => $this->connection->send(Frame::method($this->id, Protocol::BASIC, 100, (new Writer())->bit($requeue)->bytes())));
     }
@@ -234,14 +299,18 @@ final class Channel
             });
         } finally {
             $this->connection->execute(function (): void {
-                $this->open = false;
+                $this->invalidate();
                 $this->connection->releaseChannel($this->id);
             });
         }
     }
     public function invalidate(): void
     {
-        $this->open = false; $this->cancelRequested = false; $this->settled = [];
+        foreach ($this->subscriptions as $subscription) $subscription->markCancelled();
+        $this->subscriptions = [];
+        $this->legacyConsumerActive = false; $this->subscriptionWaitActive = false;
+        $this->open = false; $this->cancelRequested = false; $this->endDeliveryCallback();
+        $this->returnHandler = null;
         $this->confirms->reset(); $this->dispatcher->clear();
     }
     private function sendAck(int $method, int $tag, bool $multiple, ?bool $requeue): void
@@ -249,8 +318,25 @@ final class Channel
         $this->operation(function () use ($method, $tag, $multiple, $requeue): void {
             $writer = (new Writer())->longlong($tag)->bit($multiple); if ($requeue !== null) $writer->bit($requeue);
             $this->connection->send(Frame::method($this->id, 60, $method, $writer->bytes()));
-            $this->settled[$tag] = true;
+            $this->markCallbackSettled($tag, $multiple);
         });
+    }
+    private function beginDeliveryCallback(int $deliveryTag): void
+    {
+        $this->callbackDeliveryTag = $deliveryTag;
+        $this->callbackSettled = false;
+    }
+    private function endDeliveryCallback(): void
+    {
+        $this->callbackDeliveryTag = null;
+        $this->callbackSettled = false;
+    }
+    private function markCallbackSettled(int $deliveryTag, bool $multiple): void
+    {
+        if ($this->callbackDeliveryTag === null) return;
+        if ($multiple ? ($deliveryTag === 0 || $this->callbackDeliveryTag <= $deliveryTag) : $this->callbackDeliveryTag === $deliveryTag) {
+            $this->callbackSettled = true;
+        }
     }
     private function rpc(int $class, int $method, string $args, int $expectedClass, int $expectedMethod): Reader
     {
@@ -271,6 +357,28 @@ final class Channel
             $this->connection->send(new Frame(Frame::BODY, $this->id, substr($body, $offset, $chunk)));
         }
         return $this->confirms->published();
+    }
+    /**
+     * @param list<array{body:string,exchange:string,routingKey:string,properties:array<string,mixed>,mandatory:bool}> $messages
+     */
+    private function publishBatchMessages(array $messages, float $timeout): PublisherConfirmResult
+    {
+        return $this->operation(function () use ($messages): PublisherConfirmResult {
+            if (!$this->confirms->enabled()) {
+                $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
+                $this->confirms->enable();
+            }
+            if ($this->confirms->hasPending()) {
+                $this->dispatcher->waitForConfirms($this->confirms->highestPending(), false);
+            }
+            $sequences = [];
+            foreach ($messages as $message) {
+                $sequences[] = $this->writePublish(
+                    $message['body'], $message['exchange'], $message['routingKey'], $message['properties'], $message['mandatory'],
+                );
+            }
+            return $this->dispatcher->waitForBatch($sequences);
+        }, true, $timeout);
     }
     private function operation(callable $callback, bool $requireOpen = true, ?float $timeout = null): mixed
     {

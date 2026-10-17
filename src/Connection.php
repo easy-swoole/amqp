@@ -134,8 +134,12 @@ final class Connection
         if ($cid < 0 || $cid === $this->workerCid) return $operation();
         $this->startWorker();
         $reply = new CoroutineChannel(1);
-        $state = (object) ['cancelled'=>false, 'started'=>false];
         $startedAt = microtime(true);
+        $state = (object) [
+            'cancelled'=>false,
+            'started'=>false,
+            'deadline'=>$timeout === null || $timeout === -1.0 ? null : $startedAt + $timeout,
+        ];
         $enqueueTimeout = $timeout ?? $this->config->writeTimeout;
         if (!$this->operations?->push(['operation'=>$operation, 'reply'=>$reply, 'state'=>$state], $enqueueTimeout)) {
             throw new TimeoutException('AMQP operation timed out while waiting for the I/O worker.');
@@ -162,7 +166,11 @@ final class Connection
                 Coroutine::sleep(0.001);
             }
             $this->writing = true;
-            $this->transport->write($frame->encode());
+            $encoded = $frame->encode();
+            if ($this->frameMax > 0 && strlen($encoded) > $this->frameMax) {
+                throw new ProtocolException('Outbound frame exceeds negotiated frame-max.');
+            }
+            $this->transport->write($encoded);
             $this->lastWriteAt = microtime(true);
         } catch (\Throwable $error) {
             $this->closeTransport();
@@ -306,6 +314,11 @@ final class Connection
                     break;
                 }
                 if (is_object($state) && ($state->cancelled ?? false) === true) {
+                    unset($command, $reply, $state);
+                    continue;
+                }
+                if (is_object($state) && is_float($state->deadline ?? null) && microtime(true) >= $state->deadline) {
+                    if ($reply instanceof CoroutineChannel) $reply->push(['value'=>new TimeoutException('AMQP operation deadline exceeded before execution.')]);
                     unset($command, $reply, $state);
                     continue;
                 }

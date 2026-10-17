@@ -7,6 +7,7 @@ use EasySwoole\AMQP\Connection;
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Message;
 use EasySwoole\AMQP\Protocol;
+use EasySwoole\AMQP\PublisherConfirmResult;
 use EasySwoole\AMQP\ReturnedMessage;
 use EasySwoole\AMQP\Wire\Frame;
 use EasySwoole\AMQP\Wire\Reader;
@@ -69,8 +70,8 @@ final class ChannelDispatcher
             [$class, $method, $reader] = $this->connection->readMethod($this->channelId);
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
                 $message = $this->readReturn($reader);
-                $this->returns[] = $message;
                 if ($captureReturn) $returned = $message;
+                else $this->returns[] = $message;
                 continue;
             }
             if ($class === Protocol::BASIC && $method === Protocol::BASIC_DELIVER) {
@@ -99,15 +100,96 @@ final class ChannelDispatcher
         return $returned;
     }
 
+    /** @return array{type:'delivery'|'cancel', value:Message|string} */
+    public function nextConsumerEvent(): array
+    {
+        $queued = $this->popConsumerEvent();
+        if ($queued !== null) return $queued;
+        while (true) {
+            [$class, $method, $reader] = $this->connection->readMethod($this->channelId, false);
+            if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
+                $this->returns[] = $this->readReturn($reader);
+                continue;
+            }
+            if ($this->confirms->enabled() && $class === Protocol::BASIC && in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
+                $this->applyConfirmation($reader);
+                if ($method === Protocol::BASIC_NACK) throw new ProtocolException('RabbitMQ negatively acknowledged a published message.');
+                continue;
+            }
+            if ($class === Protocol::BASIC && $method === Protocol::BASIC_DELIVER) {
+                return ['type'=>'delivery', 'value'=>$this->readDelivery($reader)];
+            }
+            if ($class === Protocol::BASIC && in_array($method, [30, 31], true)) {
+                $consumerTag = $reader->shortstr();
+                if ($method === 30) {
+                    $this->connection->send(Frame::method(
+                        $this->channelId, Protocol::BASIC, 31, (new Writer())->shortstr($consumerTag)->bytes(),
+                    ));
+                }
+                return ['type'=>'cancel', 'value'=>$consumerTag];
+            }
+            $this->protocolFailure("Expected consumer event, received {$class}.{$method}.");
+        }
+    }
+
+    /** @param list<int> $sequences */
+    public function waitForBatch(array $sequences): PublisherConfirmResult
+    {
+        $target = max($sequences);
+        $first = min($sequences);
+        $acked = []; $nacked = []; $returned = [];
+        while ($this->confirms->hasPendingThrough($target)) {
+            [$class, $method, $reader] = $this->connection->readMethod($this->channelId);
+            if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
+                $message = $this->readReturn($reader);
+                $returned[] = $message;
+                continue;
+            }
+            if ($class === Protocol::BASIC && $method === Protocol::BASIC_DELIVER) {
+                $this->consumerEvents[] = ['type'=>'delivery', 'value'=>$this->readDelivery($reader)];
+                continue;
+            }
+            if ($class === Protocol::BASIC && in_array($method, [30, 31], true)) {
+                $this->bufferCancellation($method, $reader);
+                continue;
+            }
+            if ($class !== Protocol::BASIC || !in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
+                $this->protocolFailure("Expected publisher confirmation, received {$class}.{$method}.");
+            }
+            $settled = $this->applyConfirmation($reader);
+            foreach ($settled as $sequence) {
+                if ($sequence < $first || $sequence > $target) continue;
+                if ($method === Protocol::BASIC_ACK) $acked[] = $sequence - $first + 1;
+                else $nacked[] = $sequence - $first + 1;
+            }
+        }
+        sort($acked); sort($nacked);
+        return new PublisherConfirmResult($acked, $nacked, $returned);
+    }
+
     public function popReturn(): ?ReturnedMessage { return array_shift($this->returns); }
     /** @return null|array{type:'delivery'|'cancel', value:Message|string} */
     public function popConsumerEvent(): ?array { return array_shift($this->consumerEvents); }
     public function clear(): void { $this->returns = []; $this->consumerEvents = []; }
 
-    private function applyConfirmation(Reader $reader): void
+    /** @return list<int> */
+    private function applyConfirmation(Reader $reader): array
     {
-        try { $this->confirms->apply($reader); }
+        try { return $this->confirms->apply($reader); }
         catch (ProtocolException $error) { $this->connection->abort(); throw $error; }
+    }
+    private function bufferCancellation(int $method, Reader $reader): void
+    {
+        $consumerTag = $reader->shortstr();
+        if ($method === 30) {
+            $this->connection->send(Frame::method(
+                $this->channelId,
+                Protocol::BASIC,
+                31,
+                (new Writer())->shortstr($consumerTag)->bytes(),
+            ));
+        }
+        $this->consumerEvents[] = ['type'=>'cancel', 'value'=>$consumerTag];
     }
     private function readReturn(Reader $reader): ReturnedMessage
     {

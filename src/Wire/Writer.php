@@ -51,13 +51,29 @@ final class Writer
         match (true) {
             is_string($value) => $this->raw('S')->longstr($value),
             is_bool($value) => $this->raw('t')->octet($value ? 1 : 0),
+            $value instanceof IntegerValue => $this->integerValue($value),
             is_int($value) && $value >= -0x80000000 && $value <= 0x7fffffff => $this->raw('I')->long($value),
             is_int($value) => $this->raw('l')->longlong($value),
             is_float($value) => $this->raw('d')->raw(pack('E', $value)),
+            $value instanceof Decimal => $this->raw('D')->octet($value->scale)->long($value->unscaled),
+            $value instanceof ByteArray => $this->raw('x')->longstr($value->value),
+            $value instanceof \DateTimeInterface => $this->raw('T')->longlong($value->getTimestamp()),
             is_array($value) && array_is_list($value) => $this->raw('A')->array($value),
             is_array($value) => $this->raw('F')->table($value),
             $value === null => $this->raw('V'),
             default => throw new \InvalidArgumentException('Unsupported AMQP field value.'),
+        };
+    }
+    private function integerValue(IntegerValue $value): self
+    {
+        $this->raw($value->wireType);
+        return match ($value->wireType) {
+            'b' => $this->raw(pack('c', $value->value)),
+            'B' => $this->octet($value->value),
+            's', 'U' => $this->raw(pack('n', $value->value & 0xffff)),
+            'u' => $this->short($value->value),
+            'I', 'i' => $this->long($value->value),
+            'L', 'l' => $this->longlong($value->value),
         };
     }
 }

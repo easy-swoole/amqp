@@ -55,6 +55,34 @@ Swoole\Coroutine\run(function (): void {
 
 `get()` 和 `publishConfirmed()` 的 `timeout` 默认是 `3.0` 秒，表示整个操作的 deadline，从提交到内部 worker 时开始计算，包含排队、写帧和等待 Broker 响应。deadline 到期时，未执行的操作会被跳过；已阻塞在网络 I/O 的操作会取消连接并抛出 `TimeoutException`，因为超时后 AMQP 字节流已无法安全复用。传入 `-1.0` 表示不设置单操作 deadline。
 
+批量 Publisher Confirm 会先发送整批消息，再统一等待确认，并保留部分 ACK、NACK 和 mandatory return：
+
+```php
+$result = $channel->publisherBatch()
+    ->publish('one', 'events', 'created')
+    ->publish('two', 'events', 'missing', mandatory: true)
+    ->wait(timeout: 5.0);
+
+$result->acked;   // 批次内从 1 开始的序号
+$result->nacked;
+$result->returned;
+```
+
+同一 Channel 多 Consumer 使用 `subscribe()` 注册，再由一个 `wait()` 循环按 consumer-tag 分发：
+
+```php
+$first = $channel->subscribe('queue-a', function ($message, $channel, $subscription): void {
+    echo $message->body;
+    $subscription->cancel();
+});
+$second = $channel->subscribe('queue-b', $anotherHandler);
+$channel->wait();
+```
+
+同一 Channel 只能运行一个 `wait()`，并且不能混用阻塞式 `consume()` 与 `subscribe()`；不同 Channel 不受此限制。
+
+协议操作还包括 `exchangeBind()`、`exchangeUnbind()`、`queueUnbind()`、`queuePurge()`、`recover()` 和 `recoverAsync()`。Field table 支持 Decimal、时间戳、二进制值和显式整数位宽，分别使用 `Wire\Decimal`、`DateTimeInterface`、`Wire\ByteArray` 和 `Wire\IntegerValue` 表示。
+
 普通 `publish(..., mandatory: true)` 保持非阻塞；可通过 `setReturnHandler()` 接收之后读到的 `basic.return`，或通过 `popReturnedMessage()` 取出已解析的退回消息。若必须在本次调用中确定消息是否可路由，请使用 `publishConfirmed(..., mandatory: true)`；RabbitMQ 会先发送 `basic.return`，再发送 Publisher Confirm，客户端会完整读取两者并抛出 `MessageReturnedException`。
 
 一个连接可以建立多个 Channel。多个业务协程可以提交操作，客户端会在唯一的 I/O 协程中串行执行完整的请求/响应过程，避免 AMQP 帧交错；读取过程中遇到的其他 Channel 帧会按频道缓存。客户端本身不是连接池，也不会创建或管理多个连接。

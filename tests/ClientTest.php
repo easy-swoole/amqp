@@ -138,7 +138,6 @@ final class ClientTest extends TestCase
             self::assertSame('lost', $error->returnedMessage->message->body);
             self::assertSame('text/plain', $error->returnedMessage->message->properties['content_type']);
         }
-        self::assertSame('lost', $channel->popReturnedMessage()?->message->body);
         self::assertNull($channel->popReturnedMessage());
     }
     public function testReturnHandlerRunsOutsideIoOperationAndCanUseChannel(): void
@@ -196,6 +195,44 @@ final class ClientTest extends TestCase
         $channel->publish('two');
         $channel->publishConfirmed('three');
         self::assertNull($channel->popReturnedMessage());
+    }
+    public function testPublisherBatchReportsAckNackAndReturnedMessages(): void
+    {
+        $returned = (new Writer())->short(312)->shortstr('NO_ROUTE')->shortstr('events')->shortstr('missing')->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(3)->raw(pack('n', 0))->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 50, $returned)
+            . (new Frame(Frame::HEADER, 1, $header))->encode()
+            . (new Frame(Frame::BODY, 1, 'two'))->encode()
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(2)->bit(true)->bytes())
+            . ServerFrames::method(1, 60, 120, (new Writer())->longlong(3)->bit(false)->bit(false)->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $batch = $channel->publisherBatch()
+            ->publish('one')
+            ->publish('two', 'events', 'missing', mandatory: true)
+            ->publish('three');
+        $result = $batch->wait();
+        self::assertSame([1, 2], $result->acked);
+        self::assertSame([3], $result->nacked);
+        self::assertSame('two', $result->returned[0]->message->body);
+        self::assertFalse($result->allAcknowledged());
+        self::assertNull($channel->popReturnedMessage());
+        self::assertSame([], self::privateValue($batch, 'messages'));
+        self::assertNull(self::privateValue($batch, 'waiter'));
+    }
+    public function testPublisherBatchCannotBeEmptyOrReused(): void
+    {
+        $channel = (new AMQP(
+            new Config(),
+            new MemoryTransport(ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())),
+        ))->channel();
+        $batch = $channel->publisherBatch();
+        try { $batch->wait(); self::fail('Expected empty batch rejection.'); }
+        catch (\LogicException) {}
+        $this->expectException(\LogicException::class);
+        $batch->wait();
     }
     public function testRpcSkipsAsynchronousPublisherConfirmation(): void
     {
@@ -376,6 +413,110 @@ final class ClientTest extends TestCase
             array_values(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::METHOD)),
         );
         self::assertContains([60, 31], $methods);
+    }
+    public function testMultipleSubscriptionsAreRoutedByConsumerTag(): void
+    {
+        $delivery = static fn (string $consumer, int $tag): string => ServerFrames::method(1, 60, 60,
+            (new Writer())->shortstr($consumer)->longlong($tag)->bit(false)->shortstr('')->shortstr('jobs')->bytes()
+        );
+        $content = static fn (string $body): string => (new Frame(Frame::HEADER, 1,
+            pack('n2', 60, 0) . (new Writer())->longlong(strlen($body))->raw(pack('n', 0))->bytes()
+        ))->encode() . (new Frame(Frame::BODY, 1, $body))->encode();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('first')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('second')->bytes())
+            . $delivery('second', 1) . $content('for-second')
+            . ServerFrames::method(1, 60, 31, (new Writer())->shortstr('second')->bytes())
+            . $delivery('first', 2) . $content('for-first')
+            . ServerFrames::method(1, 60, 31, (new Writer())->shortstr('first')->bytes());
+        $transport = new MemoryTransport($incoming);
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        $received = [];
+        $first = $channel->subscribe('jobs', function (Message $message, $sameChannel, $subscription) use (&$received): void {
+            $received[] = $subscription->consumerTag . ':' . $message->body;
+            $subscription->cancel();
+        }, 'first');
+        $second = $channel->subscribe('jobs', function (Message $message, $sameChannel, $subscription) use (&$received): void {
+            $received[] = $subscription->consumerTag . ':' . $message->body;
+            $subscription->cancel();
+        }, 'second');
+        $channel->wait();
+        self::assertSame(['second:for-second', 'first:for-first'], $received);
+        self::assertFalse($first->isActive()); self::assertFalse($second->isActive());
+        self::assertNull(self::privateValue($first, 'channel')); self::assertNull(self::privateValue($first, 'handler'));
+        self::assertNull(self::privateValue($second, 'channel')); self::assertNull(self::privateValue($second, 'handler'));
+        $acks = array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::METHOD && array_slice($frame->methodParts(), 0, 2) === [60, 80]);
+        self::assertCount(2, $acks);
+    }
+    public function testUnknownConsumerTagAbortsConnection(): void
+    {
+        $delivery = (new Writer())->shortstr('other')->longlong(1)->bit(false)->shortstr('')->shortstr('jobs')->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(0)->raw(pack('n', 0))->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('known')->bytes())
+            . ServerFrames::method(1, 60, 60, $delivery)
+            . (new Frame(Frame::HEADER, 1, $header))->encode();
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        $channel->subscribe('jobs', static fn (): null => null, 'known');
+        try { $channel->wait(); self::fail('Expected unknown consumer tag.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('unknown tag', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
+    }
+    public function testLegacyConsumerRejectsDeliveryForAnotherConsumerTag(): void
+    {
+        $delivery = (new Writer())->shortstr('other')->longlong(1)->bit(false)->shortstr('')->shortstr('jobs')->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(0)->raw(pack('n', 0))->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('expected')->bytes())
+            . ServerFrames::method(1, 60, 60, $delivery)
+            . (new Frame(Frame::HEADER, 1, $header))->encode();
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        try { $channel->consume('jobs', static fn (): null => null, 'expected'); self::fail('Expected mismatched consumer tag.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('unexpected tag', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
+    }
+    public function testManualAcknowledgementsDoNotAccumulateDeliveryState(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
+        $channel = (new AMQP(new Config(), $transport))->channel();
+        for ($tag = 1; $tag <= 1000; $tag++) $channel->ack($tag);
+        self::assertNull(self::privateValue($channel, 'callbackDeliveryTag'));
+        self::assertFalse((bool) self::privateValue($channel, 'callbackSettled'));
+    }
+    public function testBlockingConsumeCannotBeMixedWithSubscriptions(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('subscription')->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $channel->subscribe('jobs', static fn (): null => null, 'subscription');
+        $this->expectException(\LogicException::class);
+        $channel->consume('jobs', static fn (): null => null, 'blocking');
+    }
+    public function testOnlyOneSubscriptionWaitLoopCanRunPerChannel(): void
+    {
+        $rejected = false;
+        Coroutine\run(function () use (&$rejected): void {
+            $incoming = ServerFrames::handshake()
+                . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+                . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('subscription')->bytes());
+            $client = new AMQP(new Config(readTimeout: 10), new BlockingTransport($incoming));
+            $channel = $client->channel();
+            $channel->subscribe('jobs', static fn (): null => null, 'subscription');
+            Coroutine::create(function () use ($channel): void { try { $channel->wait(); } catch (\Throwable) {} });
+            $deadline = microtime(true) + 0.2;
+            while (!self::privateValue($channel, 'subscriptionWaitActive') && microtime(true) < $deadline) Coroutine::sleep(0.001);
+            try { $channel->wait(); }
+            catch (\LogicException) { $rejected = true; }
+            $client->close();
+        });
+        self::assertTrue($rejected);
     }
     public function testConnectionCanReconnectAfterTransportWasClosed(): void
     {
@@ -619,6 +760,31 @@ final class ClientTest extends TestCase
             $writesLater = strlen($transport->written);
         });
         self::assertSame($writesAfterDestroy, $writesLater);
+    }
+    public function testDestructorCollectsConnectionChannelAndSubscriptionCycles(): void
+    {
+        $collected = false; $timerCleared = false;
+        Coroutine\run(function () use (&$collected, &$timerCleared): void {
+            $incoming = ServerFrames::handshake(heartbeat: 1)
+                . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+                . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('consumer')->bytes());
+            $client = new AMQP(new Config(heartbeat: 1), new MemoryTransport($incoming));
+            $channel = $client->channel();
+            $subscription = $channel->subscribe('jobs', static fn (): null => null, 'consumer');
+            $connection = self::connectionOf($client);
+            $timer = self::privateValue($connection, 'heartbeatTimerId');
+            $weakConnection = \WeakReference::create($connection);
+            $weakChannel = \WeakReference::create($channel);
+            $weakSubscription = \WeakReference::create($subscription);
+            unset($subscription, $channel, $connection, $client);
+            gc_collect_cycles();
+            Coroutine::sleep(0.01);
+            gc_collect_cycles();
+            $collected = $weakConnection->get() === null && $weakChannel->get() === null && $weakSubscription->get() === null;
+            $timerCleared = is_int($timer) && !Timer::exists($timer);
+        });
+        self::assertTrue($collected);
+        self::assertTrue($timerCleared);
     }
     public function testWorkerAndHeartbeatTimerAreNotDuplicated(): void
     {
