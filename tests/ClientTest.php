@@ -6,9 +6,13 @@ namespace EasySwoole\AMQP\Tests;
 use EasySwoole\AMQP\AMQP;
 use EasySwoole\AMQP\Config;
 use EasySwoole\AMQP\Connection;
+use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Exception\ProtocolException;
+use EasySwoole\AMQP\Exception\TimeoutException;
+use EasySwoole\AMQP\ReturnedMessage;
 use EasySwoole\AMQP\Tests\Support\MemoryTransport;
 use EasySwoole\AMQP\Tests\Support\ServerFrames;
+use EasySwoole\AMQP\Tests\Support\TimeoutTransport;
 use EasySwoole\AMQP\Wire\Frame;
 use EasySwoole\AMQP\Wire\Reader;
 use EasySwoole\AMQP\Wire\Writer;
@@ -65,6 +69,77 @@ final class ClientTest extends TestCase
         self::assertNotNull($message); self::assertSame('test', $message->body); self::assertSame(42, $message->deliveryTag); self::assertSame('text/plain', $message->properties['content_type']);
         $channel->ack($message->deliveryTag); $frames = self::writtenFrames($transport->written); self::assertSame([60,80], array_slice(end($frames)->methodParts(), 0, 2));
     }
+    public function testOversizedInboundMessageAbortsConnection(): void
+    {
+        $get = (new Writer())->longlong(1)->bit(false)->shortstr('')->shortstr('jobs')->long(0)->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(5)->raw(pack('n', 0))->bytes();
+        $incoming = ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 71, $get) . (new Frame(Frame::HEADER, 1, $header))->encode();
+        $client = new AMQP(new Config(maxMessageSize: 4), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        try { $channel->get('jobs'); self::fail('Expected oversized message rejection.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('maximum size', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
+    }
+    public function testPublisherNackIsReported(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 120, (new Writer())->longlong(1)->bit(false)->bit(false)->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('negatively acknowledged');
+        $channel->publishConfirmed('body');
+    }
+    public function testMandatoryConfirmedPublishReportsReturnedMessageAfterAck(): void
+    {
+        $returned = (new Writer())->short(312)->shortstr('NO_ROUTE')->shortstr('events')->shortstr('missing')->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(4)->raw(pack('n', 1 << 15))->shortstr('text/plain')->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 50, $returned)
+            . (new Frame(Frame::HEADER, 1, $header))->encode()
+            . (new Frame(Frame::BODY, 1, 'lost'))->encode()
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(1)->bit(false)->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        try { $channel->publishConfirmed('lost', 'events', 'missing', ['content_type'=>'text/plain'], true); self::fail('Expected returned message.'); }
+        catch (MessageReturnedException $error) {
+            self::assertSame(312, $error->getCode());
+            self::assertSame('NO_ROUTE', $error->returnedMessage->replyText);
+            self::assertSame('events', $error->returnedMessage->exchange);
+            self::assertSame('missing', $error->returnedMessage->routingKey);
+            self::assertSame('lost', $error->returnedMessage->message->body);
+            self::assertSame('text/plain', $error->returnedMessage->message->properties['content_type']);
+        }
+        self::assertSame('lost', $channel->popReturnedMessage()?->message->body);
+        self::assertNull($channel->popReturnedMessage());
+    }
+    public function testReturnHandlerRunsOutsideIoOperationAndCanUseChannel(): void
+    {
+        $returned = (new Writer())->short(312)->shortstr('NO_ROUTE')->shortstr('events')->shortstr('missing')->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(4)->raw(pack('n', 0))->bytes();
+        $queue = (new Writer())->shortstr('next')->long(0)->long(0)->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 50, $returned)
+            . (new Frame(Frame::HEADER, 1, $header))->encode()
+            . (new Frame(Frame::BODY, 1, 'lost'))->encode()
+            . ServerFrames::method(1, 50, 11, $queue)
+            . ServerFrames::method(1, 50, 11, $queue);
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $handled = null;
+        $channel->setReturnHandler(function (ReturnedMessage $returned, $sameChannel) use (&$handled, $channel): void {
+            self::assertSame($channel, $sameChannel);
+            $handled = $returned->message->body;
+            self::assertSame('next', $sameChannel->queueDeclare('next')['queue']);
+        });
+        $channel->publish('lost', 'events', 'missing', mandatory: true);
+        self::assertSame('next', $channel->queueDeclare('next')['queue']);
+        self::assertSame('lost', $handled);
+        self::assertNull($channel->popReturnedMessage());
+    }
     public function testConnectionCanReconnectAfterTransportWasClosed(): void
     {
         $transport = new MemoryTransport(ServerFrames::handshake()); $client = new AMQP(new Config(), $transport); $client->connect();
@@ -112,6 +187,20 @@ final class ClientTest extends TestCase
         catch (ProtocolException $error) { self::assertSame(404, $error->replyCode); }
         self::assertSame(1, $client->channel(1)->id);
     }
+    public function testConnectionCloseFromBrokerInvalidatesAllChannels(): void
+    {
+        $close = (new Writer())->short(320)->shortstr('forced')->short(0)->short(0)->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(0, 10, 50, $close);
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        try { $channel->queueDeclare('jobs'); self::fail('Expected broker connection.close.'); }
+        catch (ProtocolException $error) { self::assertSame(320, $error->replyCode); }
+        self::assertFalse($client->isConnected());
+        $this->expectException(\LogicException::class);
+        $channel->publish('must not be sent');
+    }
     public function testChannelIdNeverExceedsProtocolFieldWidth(): void
     {
         $client = new AMQP(new Config(channelMax: 0), new MemoryTransport(ServerFrames::handshake(channelMax: 0)));
@@ -119,13 +208,15 @@ final class ClientTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $client->channel(65536);
     }
-    public function testMandatoryPublishFailsBeforeWritingFrames(): void
+    public function testMandatoryPublishSetsMethodFlag(): void
     {
         $transport = new MemoryTransport(ServerFrames::handshake() . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
         $channel = (new AMQP(new Config(), $transport))->channel();
-        $before = strlen($transport->written);
-        try { $channel->publish('body', mandatory: true); self::fail('Expected unsupported mandatory publish exception.'); }
-        catch (\LogicException) { self::assertSame($before, strlen($transport->written)); }
+        $channel->publish('body', mandatory: true);
+        $frames = self::writtenFrames($transport->written);
+        $method = new Reader($frames[count($frames) - 3]->payload);
+        self::assertSame(60, $method->short()); self::assertSame(40, $method->short()); $method->short(); $method->shortstr(); $method->shortstr();
+        self::assertTrue($method->bit());
     }
     public function testOperationsFromDifferentCoroutinesAreSerializedByWorker(): void
     {
@@ -173,6 +264,21 @@ final class ClientTest extends TestCase
         });
         self::assertSame(2, $timeouts);
         self::assertSame(0, $executed);
+    }
+    public function testIdleReadTimeoutAtFrameBoundaryKeepsTransportOpen(): void
+    {
+        $transport = new TimeoutTransport();
+        $connection = new Connection(new Config(), $transport);
+        try { $connection->readFrame(0, false); self::fail('Expected read timeout.'); }
+        catch (TimeoutException) { self::assertSame(0, $transport->closeCount); }
+    }
+    public function testReadTimeoutAfterFrameHeaderClosesTransport(): void
+    {
+        $encoded = Frame::method(0, 10, 10, 'payload')->encode();
+        $transport = new TimeoutTransport(substr($encoded, 0, 7));
+        $connection = new Connection(new Config(), $transport);
+        try { $connection->readFrame(0, false); self::fail('Expected read timeout.'); }
+        catch (TimeoutException) { self::assertSame(1, $transport->closeCount); }
     }
     public function testHeartbeatTimerStopsWhenClientCloses(): void
     {

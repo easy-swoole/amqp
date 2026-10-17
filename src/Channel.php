@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace EasySwoole\AMQP;
 
+use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Exception\TimeoutException;
 use EasySwoole\AMQP\Wire\Frame;
@@ -18,6 +19,10 @@ final class Channel
     private array $settled = [];
     private bool $confirmMode = false;
     private bool $cancelRequested = false;
+    /** @var null|callable(ReturnedMessage, Channel):void */
+    private $returnHandler = null;
+    /** @var list<ReturnedMessage> */
+    private array $returnedMessages = [];
     public function __construct(private readonly Connection $connection, public readonly int $id) {}
     public function open(): void
     {
@@ -71,7 +76,6 @@ final class Channel
     /** @param array<string, mixed> $properties */
     public function publish(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false): void
     {
-        if ($mandatory) throw new \LogicException('mandatory publishing requires basic.return handling and is not supported yet.');
         $this->operation(function () use ($body, $exchange, $routingKey, $properties, $mandatory): void {
             $args = (new Writer())->short(0)->shortstr($exchange)->shortstr($routingKey)->bit($mandatory)->bit(false)->bytes();
             $this->connection->send(Frame::method($this->id, 60, 40, $args));
@@ -84,6 +88,9 @@ final class Channel
             }
         });
     }
+    /** @param null|callable(ReturnedMessage, Channel):void $handler */
+    public function setReturnHandler(?callable $handler): void { $this->returnHandler = $handler; }
+    public function popReturnedMessage(): ?ReturnedMessage { return array_shift($this->returnedMessages); }
     public function enablePublisherConfirms(): void
     {
         if ($this->confirmMode) return;
@@ -93,24 +100,35 @@ final class Channel
         });
     }
     /** Publish and wait until RabbitMQ confirms that it accepted the message. */
-    public function publishConfirmed(string $body, string $exchange = '', string $routingKey = '', array $properties = []): void
+    public function publishConfirmed(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false): void
     {
         $this->enablePublisherConfirms();
-        $this->publish($body, $exchange, $routingKey, $properties);
-        $this->operation(function (): void {
-            [$class, $method] = $this->connection->readMethod($this->id);
-            if ($class !== Protocol::BASIC || !in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
-                throw new ProtocolException("Expected publisher confirmation, received {$class}.{$method}.");
-            }
-            if ($method === Protocol::BASIC_NACK) throw new ProtocolException('RabbitMQ negatively acknowledged the published message.');
+        $this->publish($body, $exchange, $routingKey, $properties, $mandatory);
+        $returned = $this->operation(function (): ?ReturnedMessage {
+            $returned = null;
+            do {
+                [$class, $method, $reader] = $this->connection->readMethod($this->id);
+                if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
+                    $returned = $this->readReturnedMessage($reader);
+                    $this->returnedMessages[] = $returned;
+                    continue;
+                }
+                if ($class !== Protocol::BASIC || !in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
+                    throw new ProtocolException("Expected publisher confirmation, received {$class}.{$method}.");
+                }
+                if ($method === Protocol::BASIC_NACK) throw new ProtocolException('RabbitMQ negatively acknowledged the published message.');
+                break;
+            } while (true);
+            return $returned;
         });
+        if ($returned !== null) throw new MessageReturnedException($returned);
     }
     public function get(string $queue, bool $autoAck = false): ?Message
     {
         return $this->operation(function () use ($queue, $autoAck): ?Message {
             $args = (new Writer())->short(0)->shortstr($queue)->bit($autoAck)->bytes();
             $this->connection->send(Frame::method($this->id, 60, 70, $args));
-            [$class, $method, $reader] = $this->connection->readMethod($this->id);
+            [$class, $method, $reader] = $this->readMethodHandlingReturns();
             if ($class !== 60) throw new ProtocolException('Unexpected basic.get response.');
             if ($method === 72) { $reader->shortstr(); return null; }
             if ($method !== 71) throw new ProtocolException('Expected basic.get-ok or basic.get-empty.');
@@ -128,7 +146,7 @@ final class Channel
         while ($this->open) {
             try {
                 $message = $this->operation(function (): ?Message {
-                [$class, $method, $delivery] = $this->connection->readMethod($this->id, false);
+                [$class, $method, $delivery] = $this->readMethodHandlingReturns(false);
                 if ($class === 60 && $method === 30) {
                     $cancelledTag = $delivery->shortstr();
                     $this->connection->send(Frame::method($this->id, 60, 31, (new Writer())->shortstr($cancelledTag)->bytes()));
@@ -139,7 +157,10 @@ final class Channel
                 $consumer = $delivery->shortstr(); $deliveryTag = $delivery->longlong(); $redelivered = $delivery->bit(); $exchange = $delivery->shortstr(); $routingKey = $delivery->shortstr();
                 return $this->readContent($deliveryTag, $redelivered, $exchange, $routingKey, $consumer, null);
                 });
-            } catch (TimeoutException) { continue; }
+            } catch (TimeoutException $error) {
+                if (!$this->open || !$this->connection->isConnected()) throw $error;
+                continue;
+            }
             if ($message === null) break;
             $deliveryTag = $message->deliveryTag;
             try { $result = $handler($message, $this); }
@@ -185,7 +206,7 @@ final class Channel
             });
         }
     }
-    public function invalidate(): void { $this->open = false; $this->cancelRequested = false; $this->settled = []; }
+    public function invalidate(): void { $this->open = false; $this->cancelRequested = false; $this->settled = []; $this->returnedMessages = []; }
     private function sendAck(int $method, int $tag, bool $multiple, ?bool $requeue): void
     {
         $this->operation(function () use ($method, $tag, $multiple, $requeue): void {
@@ -196,23 +217,46 @@ final class Channel
     }
     private function rpc(int $class, int $method, string $args, int $expectedClass, int $expectedMethod): Reader
     {
-        $this->connection->send(Frame::method($this->id, $class, $method, $args)); [$actualClass, $actualMethod, $reader] = $this->connection->readMethod($this->id);
+        $this->connection->send(Frame::method($this->id, $class, $method, $args)); [$actualClass, $actualMethod, $reader] = $this->readMethodHandlingReturns();
         if ($actualClass !== $expectedClass || $actualMethod !== $expectedMethod) throw new ProtocolException("Unexpected method {$actualClass}.{$actualMethod}.");
         return $reader;
     }
+    /** @return array{int, int, Reader} */
+    private function readMethodHandlingReturns(bool $allowHeartbeatTimeout = true): array
+    {
+        while (true) {
+            [$class, $method, $reader] = $this->connection->readMethod($this->id, $allowHeartbeatTimeout);
+            if ($class !== Protocol::BASIC || $method !== Protocol::BASIC_RETURN) return [$class, $method, $reader];
+            $this->returnedMessages[] = $this->readReturnedMessage($reader);
+        }
+    }
+    private function readReturnedMessage(Reader $reader): ReturnedMessage
+    {
+        $replyCode = $reader->short();
+        $replyText = $reader->shortstr();
+        $exchange = $reader->shortstr();
+        $routingKey = $reader->shortstr();
+        $message = $this->readContent(0, false, $exchange, $routingKey, null, null);
+        return new ReturnedMessage($replyCode, $replyText, $exchange, $routingKey, $message);
+    }
     private function readContent(int $tag, bool $redelivered, string $exchange, string $routingKey, ?string $consumerTag, ?int $count): Message
     {
-        $frame = $this->connection->readFrame($this->id); if ($frame->type !== Frame::HEADER) throw new ProtocolException('Expected content header.');
-        $reader = new Reader($frame->payload); if ($reader->short() !== 60 || $reader->short() !== 0) throw new ProtocolException('Invalid basic content header.');
-        $size = $reader->longlong(); $properties = BasicProperties::decode($reader); $body = '';
-        if ($size > $this->connection->maxMessageSize()) throw new ProtocolException('Message exceeds configured maximum size.');
-        while (strlen($body) < $size) { $part = $this->connection->readFrame($this->id); if ($part->type !== Frame::BODY) throw new ProtocolException('Expected content body.'); $body .= $part->payload; }
-        if (strlen($body) !== $size) throw new ProtocolException('Content body exceeds declared size.');
-        return new Message($body, $properties, $tag, $redelivered, $exchange, $routingKey, $consumerTag, $count);
+        try {
+            $frame = $this->connection->readFrame($this->id); if ($frame->type !== Frame::HEADER) throw new ProtocolException('Expected content header.');
+            $reader = new Reader($frame->payload); if ($reader->short() !== 60 || $reader->short() !== 0) throw new ProtocolException('Invalid basic content header.');
+            $size = $reader->longlong(); $properties = BasicProperties::decode($reader); $body = '';
+            if ($size > $this->connection->maxMessageSize()) throw new ProtocolException('Message exceeds configured maximum size.');
+            while (strlen($body) < $size) { $part = $this->connection->readFrame($this->id); if ($part->type !== Frame::BODY) throw new ProtocolException('Expected content body.'); $body .= $part->payload; }
+            if (strlen($body) !== $size) throw new ProtocolException('Content body exceeds declared size.');
+            return new Message($body, $properties, $tag, $redelivered, $exchange, $routingKey, $consumerTag, $count);
+        } catch (ProtocolException $error) {
+            $this->connection->abort();
+            throw $error;
+        }
     }
     private function operation(callable $callback, bool $requireOpen = true): mixed
     {
-        return $this->connection->execute(function () use ($callback, $requireOpen): mixed {
+        $result = $this->connection->execute(function () use ($callback, $requireOpen): mixed {
             if ($this->busy) throw new \LogicException('Reentrant AMQP channel operation.');
             if ($requireOpen && !$this->open) throw new \LogicException('AMQP channel is closed.');
             $this->busy = true;
@@ -224,5 +268,12 @@ final class Channel
                 throw $error;
             } finally { $this->busy = false; }
         });
+        $this->dispatchReturnedMessages();
+        return $result;
+    }
+    private function dispatchReturnedMessages(): void
+    {
+        if ($this->returnHandler === null) return;
+        while (($returned = array_shift($this->returnedMessages)) !== null) ($this->returnHandler)($returned, $this);
     }
 }

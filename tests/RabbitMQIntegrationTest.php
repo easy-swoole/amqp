@@ -6,6 +6,7 @@ namespace EasySwoole\AMQP\Tests;
 use EasySwoole\AMQP\AMQP;
 use EasySwoole\AMQP\Channel;
 use EasySwoole\AMQP\Config;
+use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Message;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
@@ -172,6 +173,32 @@ final class RabbitMQIntegrationTest extends TestCase
         });
         if ($error !== null) throw $error;
         self::assertSame('idle-consumer', $returnedTag);
+    }
+
+    public function testMandatoryPublishReturnsUnroutableMessageAndKeepsChannelUsable(): void
+    {
+        $error = null;
+        Coroutine\run(function () use (&$error): void {
+            $client = null; $channel = null;
+            try {
+                $client = new AMQP($this->config());
+                $channel = $client->channel();
+                $routingKey = 'easyswoole.amqp.missing.' . bin2hex(random_bytes(8));
+                try {
+                    $channel->publishConfirmed('unroutable', '', $routingKey, ['content_type'=>'text/plain'], true);
+                    self::fail('RabbitMQ should return a mandatory unroutable message.');
+                } catch (MessageReturnedException $returned) {
+                    self::assertSame(312, $returned->returnedMessage->replyCode);
+                    self::assertSame('NO_ROUTE', $returned->returnedMessage->replyText);
+                    self::assertSame($routingKey, $returned->returnedMessage->routingKey);
+                    self::assertSame('unroutable', $returned->returnedMessage->message->body);
+                    self::assertSame('text/plain', $returned->returnedMessage->message->properties['content_type']);
+                }
+                self::assertNotSame('', $channel->queueDeclare('', exclusive: true, autoDelete: true)['queue']);
+            } catch (\Throwable $throwable) { $error = $throwable; }
+            finally { $client?->close(); }
+        });
+        if ($error !== null) throw $error;
     }
 
     private function waitForMessage(Channel $channel, string $queue): Message

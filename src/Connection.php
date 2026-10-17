@@ -157,19 +157,28 @@ final class Connection
         unset($this->channels[$id], $this->pendingFrames[$id]);
         if ($id < $this->nextChannel) $this->nextChannel = $id;
     }
+    public function abort(): void { $this->closeTransport(); }
     public function readFrame(int $channel, bool $closeOnTimeout = true): Frame
     {
         while (true) {
             if (($this->pendingFrames[$channel] ?? []) !== []) return array_shift($this->pendingFrames[$channel]);
+            $segmentsRead = 0;
             try {
-                $frame = Frame::read(fn (int $length) => $this->transport->read($length), $this->frameMax);
+                $frame = Frame::read(function (int $length) use (&$segmentsRead): string {
+                    $bytes = $this->transport->read($length);
+                    $segmentsRead++;
+                    return $bytes;
+                }, $this->frameMax);
                 $this->lastReadAt = microtime(true);
             } catch (TimeoutException $error) {
-                if ($closeOnTimeout) $this->closeTransport();
+                if ($closeOnTimeout || $segmentsRead > 0) $this->closeTransport();
                 throw $error;
             } catch (\Throwable $error) { $this->closeTransport(); throw $error; }
             if ($frame->type === Frame::HEARTBEAT) { $this->send(new Frame(Frame::HEARTBEAT, 0, '')); continue; }
             if ($frame->channel === 0 && $this->handleConnectionControl($frame)) continue;
+            if ($channel !== 0 && $frame->channel === 0 && $this->isConnectionClose($frame)) {
+                return $this->validateFrameForChannel($frame, $channel);
+            }
             if ($frame->channel !== $channel) {
                 if (!isset($this->channels[$frame->channel])) {
                     $this->closeTransport();
@@ -246,7 +255,7 @@ final class Connection
         $this->workerRunning = true;
         $queue = $this->operations;
         $weak = \WeakReference::create($this);
-        Coroutine::create(static function () use ($queue, $weak): void {
+        $workerCid = Coroutine::create(static function () use ($queue, $weak): void {
             while (true) {
                 $command = $queue->pop();
                 if (!is_array($command)) break;
@@ -272,7 +281,20 @@ final class Connection
                 unset($command, $value, $self);
             }
             $queue->close();
+            $self = $weak->get();
+            if ($self instanceof self && $self->operations === $queue) {
+                $self->workerRunning = false;
+                $self->workerCid = null;
+                $self->operations = null;
+            }
         });
+        if ($workerCid === false) {
+            $queue->close();
+            $this->operations = null;
+            $this->workerRunning = false;
+            throw new \RuntimeException('Unable to create AMQP I/O worker coroutine.');
+        }
+        $this->workerCid = $workerCid;
     }
     private function stopWorker(): void
     {
@@ -282,22 +304,32 @@ final class Connection
             return;
         }
         $reply = new CoroutineChannel(1);
-        $this->operations->push(['stop'=>true, 'reply'=>$reply]);
-        $reply->pop($this->config->writeTimeout);
+        $queue = $this->operations;
+        $queued = $queue->push(['stop'=>true, 'reply'=>$reply], $this->config->writeTimeout);
+        $stopped = $queued ? $reply->pop($this->config->writeTimeout) : false;
         $reply->close();
-        $this->workerRunning = false; $this->workerCid = null; $this->operations = null;
+        if (is_array($stopped)) {
+            $this->workerRunning = false; $this->workerCid = null; $this->operations = null;
+            return;
+        }
+        // Keep workerRunning=true until the worker actually exits, preventing a second worker
+        // from being created against the same transport during forced shutdown.
+        $this->transport->close();
+        $queue->close();
     }
     private function startHeartbeatTimer(): void
     {
         $this->clearHeartbeatTimer();
         if ($this->heartbeat <= 0 || Coroutine::getCid() < 0) return;
         $weak = \WeakReference::create($this);
-        $this->heartbeatTimerId = Timer::tick(max(1000, intdiv($this->heartbeat * 1000, 2)), static function () use ($weak): void {
+        $timerId = Timer::tick(max(1000, intdiv($this->heartbeat * 1000, 2)), static function () use ($weak): void {
             $self = $weak->get();
             if (!$self instanceof self || !$self->workerRunning || !$self->operations) return;
             // The timer only submits work. The socket remains owned by the I/O worker.
             $self->operations->push(['operation'=>fn () => $self->sendHeartbeatIfDue(), 'reply'=>null], 0.001);
         });
+        if ($timerId === false) throw new \RuntimeException('Unable to create AMQP heartbeat timer.');
+        $this->heartbeatTimerId = $timerId;
     }
     private function clearHeartbeatTimer(): void
     {

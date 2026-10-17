@@ -2,7 +2,7 @@
 
 基于 `Swoole\Coroutine\Socket` 的轻量 AMQP 0-9-1 客户端。协议编解码由本项目实现，不依赖阻塞式 AMQP 扩展。
 
-运行要求：PHP 8.1+、Swoole 5.1+。客户端仅使用 Swoole 5.1 已提供的 `Coroutine`、`Coroutine\Channel`、`Coroutine\Socket`、`Timer`、`sendAll()`、`recvAll()` 和 `setProtocol()` API，不依赖 Swoole 6.x 新增接口。
+运行要求：PHP 8.1+、Swoole 5.1+。
 
 ## 使用
 
@@ -34,6 +34,13 @@ Swoole\Coroutine\run(function (): void {
         'delivery_mode' => 2,
     ]);
 
+    // mandatory 消息无法路由时，basic.return 会携带原消息返回。
+    try {
+        $channel->publishConfirmed('must-route', 'events', 'missing', mandatory: true);
+    } catch (\EasySwoole\AMQP\Exception\MessageReturnedException $error) {
+        echo $error->returnedMessage->replyText; // NO_ROUTE
+    }
+
     $channel->qos(10);
     $channel->consume('jobs', function ($message): bool {
         echo $message->body, PHP_EOL;
@@ -45,6 +52,8 @@ Swoole\Coroutine\run(function (): void {
 ```
 
 也可以用 `get()` 拉取单条消息，并通过 `ack()`、`nack()` 或 `reject()` 手动确认。传入自定义 `TransportInterface` 可进行无网络测试。
+
+普通 `publish(..., mandatory: true)` 保持非阻塞；可通过 `setReturnHandler()` 接收之后读到的 `basic.return`，或通过 `popReturnedMessage()` 取出已解析的退回消息。若必须在本次调用中确定消息是否可路由，请使用 `publishConfirmed(..., mandatory: true)`；RabbitMQ 会先发送 `basic.return`，再发送 Publisher Confirm，客户端会完整读取两者并抛出 `MessageReturnedException`。
 
 一个连接可以建立多个 Channel。多个业务协程可以提交操作，客户端会在唯一的 I/O 协程中串行执行完整的请求/响应过程，避免 AMQP 帧交错；读取过程中遇到的其他 Channel 帧会按频道缓存。客户端本身不是连接池，也不会创建或管理多个连接。
 
