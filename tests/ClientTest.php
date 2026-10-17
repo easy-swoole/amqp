@@ -6,11 +6,13 @@ namespace EasySwoole\AMQP\Tests;
 use EasySwoole\AMQP\AMQP;
 use EasySwoole\AMQP\Config;
 use EasySwoole\AMQP\Connection;
+use EasySwoole\AMQP\Message;
 use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Exception\TimeoutException;
 use EasySwoole\AMQP\ReturnedMessage;
 use EasySwoole\AMQP\Tests\Support\MemoryTransport;
+use EasySwoole\AMQP\Tests\Support\BlockingTransport;
 use EasySwoole\AMQP\Tests\Support\ServerFrames;
 use EasySwoole\AMQP\Tests\Support\TimeoutTransport;
 use EasySwoole\AMQP\Wire\Frame;
@@ -139,6 +141,173 @@ final class ClientTest extends TestCase
         self::assertSame('next', $channel->queueDeclare('next')['queue']);
         self::assertSame('lost', $handled);
         self::assertNull($channel->popReturnedMessage());
+    }
+    public function testEarlierMandatoryReturnIsNotAttributedToNextConfirmedPublish(): void
+    {
+        $returned = (new Writer())->short(312)->shortstr('NO_ROUTE')->shortstr('events')->shortstr('old')->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(3)->raw(pack('n', 0))->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 50, $returned)
+            . (new Frame(Frame::HEADER, 1, $header))->encode()
+            . (new Frame(Frame::BODY, 1, 'old'))->encode()
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(1)->bit(false)->bytes())
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(2)->bit(false)->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $channel->enablePublisherConfirms();
+        $channel->publish('old', 'events', 'old', mandatory: true);
+        $channel->publishConfirmed('new', 'events', 'valid', mandatory: true);
+        self::assertSame('old', $channel->popReturnedMessage()?->message->body);
+    }
+    public function testMultipleConfirmationDrainsEarlierPlainPublishes(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(2)->bit(true)->bytes())
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(3)->bit(false)->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $channel->enablePublisherConfirms();
+        $channel->publish('one');
+        $channel->publish('two');
+        $channel->publishConfirmed('three');
+        self::assertNull($channel->popReturnedMessage());
+    }
+    public function testRpcSkipsAsynchronousPublisherConfirmation(): void
+    {
+        $declared = (new Writer())->shortstr('jobs')->long(0)->long(0)->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(1)->bit(false)->bytes())
+            . ServerFrames::method(1, 50, 11, $declared);
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $channel->enablePublisherConfirms();
+        $channel->publish('one');
+        self::assertSame('jobs', $channel->queueDeclare('jobs')['queue']);
+    }
+    public function testUnknownPublisherConfirmationTagAbortsConnection(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 85, 11)
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(2)->bit(false)->bytes());
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        try { $channel->publishConfirmed('one'); self::fail('Expected invalid confirmation tag.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('unknown delivery tag', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
+    }
+    public function testGetOperationDeadlineCancelsBlockedRead(): void
+    {
+        $elapsed = 0.0;
+        Coroutine\run(function () use (&$elapsed): void {
+            $incoming = ServerFrames::handshake()
+                . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes());
+            $client = new AMQP(new Config(readTimeout: 10), new BlockingTransport($incoming));
+            $channel = $client->channel();
+            $started = microtime(true);
+            try { $channel->get('jobs', timeout: 0.05); self::fail('Expected operation deadline.'); }
+            catch (TimeoutException $error) { self::assertStringContainsString('deadline', $error->getMessage()); }
+            $elapsed = microtime(true) - $started;
+            self::assertFalse($client->isConnected());
+            $client->close();
+        });
+        self::assertLessThan(0.5, $elapsed);
+    }
+    public function testConfirmedPublishDeadlineIncludesWaitingForBrokerAck(): void
+    {
+        Coroutine\run(function (): void {
+            $incoming = ServerFrames::handshake()
+                . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+                . ServerFrames::method(1, 85, 11);
+            $client = new AMQP(new Config(readTimeout: 10), new BlockingTransport($incoming));
+            $channel = $client->channel();
+            try { $channel->publishConfirmed(body: 'waiting', timeout: 0.05); self::fail('Expected publisher confirmation deadline.'); }
+            catch (TimeoutException) { self::assertFalse($client->isConnected()); }
+            $client->close();
+        });
+    }
+    public function testOperationDeadlineMustBePositiveOrMinusOne(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $this->expectException(\InvalidArgumentException::class);
+        $channel->get('jobs', timeout: 0);
+    }
+    public function testPublicBlockingOperationsDefaultToThreeSecondDeadline(): void
+    {
+        $get = new \ReflectionMethod(\EasySwoole\AMQP\Channel::class, 'get');
+        $confirmed = new \ReflectionMethod(\EasySwoole\AMQP\Channel::class, 'publishConfirmed');
+        self::assertSame(3.0, $get->getParameters()[2]->getDefaultValue());
+        self::assertSame('float', (string) $get->getParameters()[2]->getType());
+        self::assertSame(3.0, $confirmed->getParameters()[5]->getDefaultValue());
+        self::assertSame('float', (string) $confirmed->getParameters()[5]->getType());
+    }
+    public function testInvalidBasicPropertyContinuationFlagAbortsConnection(): void
+    {
+        $get = (new Writer())->longlong(1)->bit(false)->shortstr('')->shortstr('jobs')->long(0)->bytes();
+        $header = pack('n2', 60, 0) . (new Writer())->longlong(0)->raw(pack('n', 1))->bytes();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 71, $get)
+            . (new Frame(Frame::HEADER, 1, $header))->encode();
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        try { $client->channel()->get('jobs'); self::fail('Expected invalid property flags.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('continuation flag', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
+    }
+    public function testConcurrentConfirmedPublishesCannotInterleaveSendAndWait(): void
+    {
+        $errors = [];
+        Coroutine\run(function () use (&$errors): void {
+            $incoming = ServerFrames::handshake()
+                . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+                . ServerFrames::method(1, 85, 11)
+                . ServerFrames::method(1, 60, 80, (new Writer())->longlong(1)->bit(false)->bytes())
+                . ServerFrames::method(1, 60, 80, (new Writer())->longlong(2)->bit(false)->bytes());
+            $client = new AMQP(new Config(), new MemoryTransport($incoming));
+            $channel = $client->channel();
+            $done = new Coroutine\Channel(2);
+            foreach (['one', 'two'] as $body) Coroutine::create(function () use ($channel, $body, $done): void {
+                try { $channel->publishConfirmed($body); $done->push(null); }
+                catch (\Throwable $error) { $done->push($error); }
+            });
+            for ($index = 0; $index < 2; $index++) {
+                $result = $done->pop(2);
+                if ($result instanceof \Throwable) $errors[] = $result;
+            }
+            $client->close();
+        });
+        self::assertSame([], $errors);
+    }
+    public function testDeliveryInterleavedWithPublisherConfirmIsBufferedForConsumer(): void
+    {
+        $consumeOk = (new Writer())->shortstr('consumer')->bytes();
+        $delivery = static fn (int $tag): string => ServerFrames::method(1, 60, 60,
+            (new Writer())->shortstr('consumer')->longlong($tag)->bit(false)->shortstr('')->shortstr('jobs')->bytes()
+        );
+        $content = static fn (string $body): string => (new Frame(Frame::HEADER, 1,
+            pack('n2', 60, 0) . (new Writer())->longlong(strlen($body))->raw(pack('n', 0))->bytes()
+        ))->encode() . (new Frame(Frame::BODY, 1, $body))->encode();
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, $consumeOk)
+            . $delivery(1) . $content('first')
+            . ServerFrames::method(1, 85, 11)
+            . $delivery(2) . $content('second')
+            . ServerFrames::method(1, 60, 80, (new Writer())->longlong(1)->bit(false)->bytes())
+            . ServerFrames::method(1, 60, 31, (new Writer())->shortstr('consumer')->bytes());
+        $channel = (new AMQP(new Config(), new MemoryTransport($incoming)))->channel();
+        $received = [];
+        $channel->consume('jobs', function (Message $message, $sameChannel) use (&$received): void {
+            $received[] = $message->body;
+            if ($message->body === 'first') $sameChannel->publishConfirmed('reply');
+            else $sameChannel->cancel('consumer');
+        }, 'consumer', autoAck: true);
+        self::assertSame(['first', 'second'], $received);
     }
     public function testConnectionCanReconnectAfterTransportWasClosed(): void
     {
@@ -299,6 +468,74 @@ final class ClientTest extends TestCase
         if ($error !== null) throw $error;
         self::assertGreaterThanOrEqual(1, $heartbeatFrames);
         self::assertSame($writesAfterClose, $writesLater);
+    }
+    public function testCloseInterruptsBlockedConsumerAndStopsWorkerPromptly(): void
+    {
+        $elapsed = 0.0; $consumerStopped = false;
+        Coroutine\run(function () use (&$elapsed, &$consumerStopped): void {
+            $incoming = ServerFrames::handshake()
+                . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+                . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('idle')->bytes());
+            $client = new AMQP(new Config(readTimeout: 10), new BlockingTransport($incoming));
+            $channel = $client->channel();
+            $done = new Coroutine\Channel(1);
+            Coroutine::create(function () use ($channel, $done): void {
+                try { $channel->consume('jobs', static fn (): bool => true, 'idle'); $done->push(null); }
+                catch (\Throwable $error) { $done->push($error); }
+            });
+            Coroutine::sleep(0.02);
+            $started = microtime(true);
+            $client->close();
+            $elapsed = microtime(true) - $started;
+            $consumerStopped = $done->pop(0.5) instanceof \Throwable;
+            $connection = self::connectionOf($client);
+            self::assertFalse((bool) self::privateValue($connection, 'workerRunning'));
+            self::assertNull(self::privateValue($connection, 'heartbeatTimerId'));
+        });
+        self::assertTrue($consumerStopped);
+        self::assertLessThan(0.5, $elapsed);
+    }
+    public function testNewOperationsAreRejectedWhileConnectionIsClosing(): void
+    {
+        $rejected = false;
+        Coroutine\run(function () use (&$rejected): void {
+            $connection = new Connection(new Config(), new MemoryTransport());
+            $started = new Coroutine\Channel(1);
+            Coroutine::create(function () use ($connection, $started): void {
+                $connection->execute(function () use ($started): void { $started->push(true); Coroutine::sleep(0.1); });
+            });
+            $started->pop(0.5);
+            Coroutine::create(fn () => $connection->close());
+            Coroutine::sleep(0.01);
+            try { $connection->execute(static fn (): null => null); }
+            catch (\LogicException $error) { $rejected = str_contains($error->getMessage(), 'closing'); }
+            Coroutine::sleep(0.15);
+        });
+        self::assertTrue($rejected);
+    }
+    public function testForcedStopKeepsClosingGateUntilOldWorkerActuallyExits(): void
+    {
+        $closedGate = false; $reusable = false;
+        Coroutine\run(function () use (&$closedGate, &$reusable): void {
+            $connection = new Connection(
+                new Config(connectTimeout: 0.05, readTimeout: 0.05, writeTimeout: 0.05),
+                new MemoryTransport(),
+            );
+            $started = new Coroutine\Channel(1);
+            Coroutine::create(function () use ($connection, $started): void {
+                try { $connection->execute(function () use ($started): void { $started->push(true); Coroutine::sleep(1.3); }); }
+                catch (\RuntimeException) {}
+            });
+            $started->pop(0.5);
+            $connection->close();
+            try { $connection->execute(static fn (): null => null); }
+            catch (\LogicException) { $closedGate = true; }
+            Coroutine::sleep(0.3);
+            $reusable = $connection->execute(static fn (): bool => true);
+            $connection->close();
+        });
+        self::assertTrue($closedGate);
+        self::assertTrue($reusable);
     }
     public function testDestructorStopsHeartbeatTimer(): void
     {

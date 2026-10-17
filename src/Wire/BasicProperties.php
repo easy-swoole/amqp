@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 namespace EasySwoole\AMQP\Wire;
 
+use EasySwoole\AMQP\Exception\ProtocolException;
+
 /** Encodes and decodes the fixed property list of AMQP class basic (60). */
 final class BasicProperties
 {
@@ -37,7 +39,7 @@ final class BasicProperties
     public static function decode(Reader $reader): array
     {
         $flags = $reader->short(); $result = [];
-        if (($flags & 1) !== 0) throw new \UnexpectedValueException('Multiple basic property flag words are unsupported by AMQP 0-9-1.');
+        if (($flags & 1) !== 0) throw new ProtocolException('Invalid continuation flag in basic properties.');
         foreach (self::TYPES as $name => [$bit, $type]) {
             if (($flags & (1 << $bit)) === 0) continue;
             $result[$name] = match ($type) {

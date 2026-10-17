@@ -6,6 +6,9 @@ namespace EasySwoole\AMQP;
 use EasySwoole\AMQP\Exception\MessageReturnedException;
 use EasySwoole\AMQP\Exception\ProtocolException;
 use EasySwoole\AMQP\Exception\TimeoutException;
+use EasySwoole\AMQP\Internal\ChannelDispatcher;
+use EasySwoole\AMQP\Internal\ContentReader;
+use EasySwoole\AMQP\Internal\PublisherConfirmTracker;
 use EasySwoole\AMQP\Wire\Frame;
 use EasySwoole\AMQP\Wire\BasicProperties;
 use EasySwoole\AMQP\Wire\Reader;
@@ -17,13 +20,18 @@ final class Channel
     private bool $busy = false;
     /** @var array<int, true> */
     private array $settled = [];
-    private bool $confirmMode = false;
     private bool $cancelRequested = false;
     /** @var null|callable(ReturnedMessage, Channel):void */
     private $returnHandler = null;
-    /** @var list<ReturnedMessage> */
-    private array $returnedMessages = [];
-    public function __construct(private readonly Connection $connection, public readonly int $id) {}
+    private readonly ContentReader $contentReader;
+    private readonly PublisherConfirmTracker $confirms;
+    private readonly ChannelDispatcher $dispatcher;
+    public function __construct(private readonly Connection $connection, public readonly int $id)
+    {
+        $this->contentReader = new ContentReader($connection, $id);
+        $this->confirms = new PublisherConfirmTracker();
+        $this->dispatcher = new ChannelDispatcher($connection, $id, $this->contentReader, $this->confirms);
+    }
     public function open(): void
     {
         $this->operation(function (): void {
@@ -76,65 +84,53 @@ final class Channel
     /** @param array<string, mixed> $properties */
     public function publish(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false): void
     {
-        $this->operation(function () use ($body, $exchange, $routingKey, $properties, $mandatory): void {
-            $args = (new Writer())->short(0)->shortstr($exchange)->shortstr($routingKey)->bit($mandatory)->bit(false)->bytes();
-            $this->connection->send(Frame::method($this->id, 60, 40, $args));
-            $propertyBytes = BasicProperties::encode($properties);
-            $header = pack('n2', 60, 0) . (new Writer())->longlong(strlen($body))->raw($propertyBytes)->bytes();
-            $this->connection->send(new Frame(Frame::HEADER, $this->id, $header));
-            $chunk = max(1, ($this->connection->frameMax() ?: 131072) - 8);
-            for ($offset = 0, $length = strlen($body); $offset < $length; $offset += $chunk) {
-                $this->connection->send(new Frame(Frame::BODY, $this->id, substr($body, $offset, $chunk)));
-            }
-        });
+        $this->operation(fn (): int => $this->writePublish($body, $exchange, $routingKey, $properties, $mandatory));
     }
     /** @param null|callable(ReturnedMessage, Channel):void $handler */
-    public function setReturnHandler(?callable $handler): void { $this->returnHandler = $handler; }
-    public function popReturnedMessage(): ?ReturnedMessage { return array_shift($this->returnedMessages); }
+    public function setReturnHandler(?callable $handler): void
+    {
+        $this->returnHandler = $handler;
+        if ($handler !== null) $this->dispatchReturnedMessages();
+    }
+    public function popReturnedMessage(): ?ReturnedMessage { return $this->dispatcher->popReturn(); }
     public function enablePublisherConfirms(): void
     {
-        if ($this->confirmMode) return;
         $this->operation(function (): void {
+            if ($this->confirms->enabled()) return;
             $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
-            $this->confirmMode = true;
+            $this->confirms->enable();
         });
     }
     /** Publish and wait until RabbitMQ confirms that it accepted the message. */
-    public function publishConfirmed(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false): void
+    public function publishConfirmed(string $body, string $exchange = '', string $routingKey = '', array $properties = [], bool $mandatory = false, float $timeout = 3.0): void
     {
-        $this->enablePublisherConfirms();
-        $this->publish($body, $exchange, $routingKey, $properties, $mandatory);
-        $returned = $this->operation(function (): ?ReturnedMessage {
-            $returned = null;
-            do {
-                [$class, $method, $reader] = $this->connection->readMethod($this->id);
-                if ($class === Protocol::BASIC && $method === Protocol::BASIC_RETURN) {
-                    $returned = $this->readReturnedMessage($reader);
-                    $this->returnedMessages[] = $returned;
-                    continue;
-                }
-                if ($class !== Protocol::BASIC || !in_array($method, [Protocol::BASIC_ACK, Protocol::BASIC_NACK], true)) {
-                    throw new ProtocolException("Expected publisher confirmation, received {$class}.{$method}.");
-                }
-                if ($method === Protocol::BASIC_NACK) throw new ProtocolException('RabbitMQ negatively acknowledged the published message.');
-                break;
-            } while (true);
-            return $returned;
-        });
+        $returned = $this->operation(function () use ($body, $exchange, $routingKey, $properties, $mandatory): ?ReturnedMessage {
+            if (!$this->confirms->enabled()) {
+                $this->rpc(Protocol::CONFIRM, 10, (new Writer())->bit(false)->bytes(), Protocol::CONFIRM, 11);
+                $this->confirms->enable();
+            }
+            // Plain publish() calls made after confirm.select also receive confirms. Drain them
+            // before sending this message so an earlier return/ACK cannot be attributed to it.
+            if ($this->confirms->hasPending()) {
+                $this->dispatcher->waitForConfirms($this->confirms->highestPending(), false);
+            }
+            $sequence = $this->writePublish($body, $exchange, $routingKey, $properties, $mandatory);
+            return $this->dispatcher->waitForConfirms($sequence, true);
+        }, true, $timeout);
         if ($returned !== null) throw new MessageReturnedException($returned);
     }
-    public function get(string $queue, bool $autoAck = false): ?Message
+    public function get(string $queue, bool $autoAck = false, float $timeout = 3.0): ?Message
     {
         return $this->operation(function () use ($queue, $autoAck): ?Message {
             $args = (new Writer())->short(0)->shortstr($queue)->bit($autoAck)->bytes();
             $this->connection->send(Frame::method($this->id, 60, 70, $args));
-            [$class, $method, $reader] = $this->readMethodHandlingReturns();
+            [$class, $method, $reader] = $this->dispatcher->readMethod();
             if ($class !== 60) throw new ProtocolException('Unexpected basic.get response.');
             if ($method === 72) { $reader->shortstr(); return null; }
             if ($method !== 71) throw new ProtocolException('Expected basic.get-ok or basic.get-empty.');
             $tag = $reader->longlong(); $redelivered = $reader->bit(); $exchange = $reader->shortstr(); $routingKey = $reader->shortstr(); $count = $reader->long();
-            return $this->readContent($tag, $redelivered, $exchange, $routingKey, null, $count);
-        });
+            return $this->contentReader->read($tag, $redelivered, $exchange, $routingKey, null, $count);
+        }, true, $timeout);
     }
     public function consume(string $queue, callable $handler, string $consumerTag = '', bool $autoAck = false, bool $exclusive = false, array $arguments = []): string
     {
@@ -146,7 +142,9 @@ final class Channel
         while ($this->open) {
             try {
                 $message = $this->operation(function (): ?Message {
-                [$class, $method, $delivery] = $this->readMethodHandlingReturns(false);
+                $queued = $this->dispatcher->popDelivery();
+                if ($queued !== null) return $queued;
+                [$class, $method, $delivery] = $this->dispatcher->readMethod(false, false);
                 if ($class === 60 && $method === 30) {
                     $cancelledTag = $delivery->shortstr();
                     $this->connection->send(Frame::method($this->id, 60, 31, (new Writer())->shortstr($cancelledTag)->bytes()));
@@ -155,7 +153,7 @@ final class Channel
                 if ($class === 60 && $method === 31 && $this->cancelRequested) { $this->cancelRequested = false; return null; }
                 if ($class !== 60 || $method !== 60) throw new ProtocolException('Expected basic.deliver.');
                 $consumer = $delivery->shortstr(); $deliveryTag = $delivery->longlong(); $redelivered = $delivery->bit(); $exchange = $delivery->shortstr(); $routingKey = $delivery->shortstr();
-                return $this->readContent($deliveryTag, $redelivered, $exchange, $routingKey, $consumer, null);
+                return $this->contentReader->read($deliveryTag, $redelivered, $exchange, $routingKey, $consumer);
                 });
             } catch (TimeoutException $error) {
                 if (!$this->open || !$this->connection->isConnected()) throw $error;
@@ -206,7 +204,11 @@ final class Channel
             });
         }
     }
-    public function invalidate(): void { $this->open = false; $this->cancelRequested = false; $this->settled = []; $this->returnedMessages = []; }
+    public function invalidate(): void
+    {
+        $this->open = false; $this->cancelRequested = false; $this->settled = [];
+        $this->confirms->reset(); $this->dispatcher->clear();
+    }
     private function sendAck(int $method, int $tag, bool $multiple, ?bool $requeue): void
     {
         $this->operation(function () use ($method, $tag, $multiple, $requeue): void {
@@ -217,44 +219,25 @@ final class Channel
     }
     private function rpc(int $class, int $method, string $args, int $expectedClass, int $expectedMethod): Reader
     {
-        $this->connection->send(Frame::method($this->id, $class, $method, $args)); [$actualClass, $actualMethod, $reader] = $this->readMethodHandlingReturns();
+        $this->connection->send(Frame::method($this->id, $class, $method, $args)); [$actualClass, $actualMethod, $reader] = $this->dispatcher->readMethod();
         if ($actualClass !== $expectedClass || $actualMethod !== $expectedMethod) throw new ProtocolException("Unexpected method {$actualClass}.{$actualMethod}.");
         return $reader;
     }
-    /** @return array{int, int, Reader} */
-    private function readMethodHandlingReturns(bool $allowHeartbeatTimeout = true): array
+    /** @param array<string, mixed> $properties */
+    private function writePublish(string $body, string $exchange, string $routingKey, array $properties, bool $mandatory): int
     {
-        while (true) {
-            [$class, $method, $reader] = $this->connection->readMethod($this->id, $allowHeartbeatTimeout);
-            if ($class !== Protocol::BASIC || $method !== Protocol::BASIC_RETURN) return [$class, $method, $reader];
-            $this->returnedMessages[] = $this->readReturnedMessage($reader);
+        $args = (new Writer())->short(0)->shortstr($exchange)->shortstr($routingKey)->bit($mandatory)->bit(false)->bytes();
+        $this->connection->send(Frame::method($this->id, Protocol::BASIC, 40, $args));
+        $propertyBytes = BasicProperties::encode($properties);
+        $header = pack('n2', Protocol::BASIC, 0) . (new Writer())->longlong(strlen($body))->raw($propertyBytes)->bytes();
+        $this->connection->send(new Frame(Frame::HEADER, $this->id, $header));
+        $chunk = max(1, ($this->connection->frameMax() ?: 131072) - 8);
+        for ($offset = 0, $length = strlen($body); $offset < $length; $offset += $chunk) {
+            $this->connection->send(new Frame(Frame::BODY, $this->id, substr($body, $offset, $chunk)));
         }
+        return $this->confirms->published();
     }
-    private function readReturnedMessage(Reader $reader): ReturnedMessage
-    {
-        $replyCode = $reader->short();
-        $replyText = $reader->shortstr();
-        $exchange = $reader->shortstr();
-        $routingKey = $reader->shortstr();
-        $message = $this->readContent(0, false, $exchange, $routingKey, null, null);
-        return new ReturnedMessage($replyCode, $replyText, $exchange, $routingKey, $message);
-    }
-    private function readContent(int $tag, bool $redelivered, string $exchange, string $routingKey, ?string $consumerTag, ?int $count): Message
-    {
-        try {
-            $frame = $this->connection->readFrame($this->id); if ($frame->type !== Frame::HEADER) throw new ProtocolException('Expected content header.');
-            $reader = new Reader($frame->payload); if ($reader->short() !== 60 || $reader->short() !== 0) throw new ProtocolException('Invalid basic content header.');
-            $size = $reader->longlong(); $properties = BasicProperties::decode($reader); $body = '';
-            if ($size > $this->connection->maxMessageSize()) throw new ProtocolException('Message exceeds configured maximum size.');
-            while (strlen($body) < $size) { $part = $this->connection->readFrame($this->id); if ($part->type !== Frame::BODY) throw new ProtocolException('Expected content body.'); $body .= $part->payload; }
-            if (strlen($body) !== $size) throw new ProtocolException('Content body exceeds declared size.');
-            return new Message($body, $properties, $tag, $redelivered, $exchange, $routingKey, $consumerTag, $count);
-        } catch (ProtocolException $error) {
-            $this->connection->abort();
-            throw $error;
-        }
-    }
-    private function operation(callable $callback, bool $requireOpen = true): mixed
+    private function operation(callable $callback, bool $requireOpen = true, ?float $timeout = null): mixed
     {
         $result = $this->connection->execute(function () use ($callback, $requireOpen): mixed {
             if ($this->busy) throw new \LogicException('Reentrant AMQP channel operation.');
@@ -267,13 +250,13 @@ final class Channel
                 }
                 throw $error;
             } finally { $this->busy = false; }
-        });
+        }, $timeout);
         $this->dispatchReturnedMessages();
         return $result;
     }
     private function dispatchReturnedMessages(): void
     {
         if ($this->returnHandler === null) return;
-        while (($returned = array_shift($this->returnedMessages)) !== null) ($this->returnHandler)($returned, $this);
+        while (($returned = $this->dispatcher->popReturn()) !== null) ($this->returnHandler)($returned, $this);
     }
 }

@@ -26,6 +26,8 @@ final class Connection
     private ?CoroutineChannel $operations = null;
     private ?int $workerCid = null;
     private bool $workerRunning = false;
+    private bool $workerBusy = false;
+    private bool $closing = false;
     private ?int $heartbeatTimerId = null;
     /** @var array<int, true|Channel> */
     private array $channels = [];
@@ -45,6 +47,7 @@ final class Connection
     public function __destruct()
     {
         // Destructors cannot safely wait for coroutine work; perform an immediate fallback cleanup.
+        $this->closing = true;
         $this->clearHeartbeatTimer();
         $this->workerRunning = false;
         $this->operations?->close();
@@ -117,23 +120,37 @@ final class Connection
     public function frameMax(): int { return $this->frameMax; }
     public function maxMessageSize(): int { return $this->config->maxMessageSize; }
     public function blockedReason(): ?string { return $this->blockedReason; }
-    public function execute(callable $operation): mixed
+    public function execute(callable $operation, ?float $timeout = null): mixed
     {
+        if ($this->closing) throw new \LogicException('AMQP connection is closing.');
+        return $this->executeOperation($operation, $timeout);
+    }
+    private function executeOperation(callable $operation, ?float $timeout = null): mixed
+    {
+        if ($timeout !== null && (!is_finite($timeout) || ($timeout <= 0 && $timeout !== -1.0))) {
+            throw new \InvalidArgumentException('Operation timeout must be positive seconds, -1, or null.');
+        }
         $cid = Coroutine::getCid();
         if ($cid < 0 || $cid === $this->workerCid) return $operation();
         $this->startWorker();
         $reply = new CoroutineChannel(1);
-        $state = (object) ['cancelled'=>false];
-        if (!$this->operations?->push(['operation'=>$operation, 'reply'=>$reply, 'state'=>$state], $this->config->writeTimeout)) {
-            throw new \RuntimeException('Unable to enqueue AMQP operation.');
+        $state = (object) ['cancelled'=>false, 'started'=>false];
+        $startedAt = microtime(true);
+        $enqueueTimeout = $timeout === null || $timeout === -1.0 ? $this->config->writeTimeout : min($this->config->writeTimeout, $timeout);
+        if (!$this->operations?->push(['operation'=>$operation, 'reply'=>$reply, 'state'=>$state], $enqueueTimeout)) {
+            throw new TimeoutException('AMQP operation timed out while waiting for the I/O worker.');
         }
-        $timeout = $this->config->readTimeout === -1.0
+        $waitTimeout = $timeout ?? ($this->config->readTimeout === -1.0
             ? -1
-            : max($this->config->connectTimeout, $this->config->readTimeout, $this->config->writeTimeout) + 1;
-        $result = $reply->pop($timeout);
-        if (!is_array($result)) $state->cancelled = true;
+            : max($this->config->connectTimeout, $this->config->readTimeout, $this->config->writeTimeout) + 1);
+        if ($waitTimeout !== -1) $waitTimeout = max(0.001, $waitTimeout - (microtime(true) - $startedAt));
+        $result = $reply->pop($waitTimeout);
+        if (!is_array($result)) {
+            $state->cancelled = true;
+            if ($state->started) $this->closeTransport();
+        }
         $reply->close();
-        if (!is_array($result) || !array_key_exists('value', $result)) throw new \RuntimeException('AMQP operation did not complete before its timeout.');
+        if (!is_array($result) || !array_key_exists('value', $result)) throw new TimeoutException('AMQP operation deadline exceeded.');
         if ($result['value'] instanceof \Throwable) throw $result['value'];
         return $result['value'];
     }
@@ -204,15 +221,38 @@ final class Connection
     }
     public function close(): void
     {
+        if ($this->closing) return;
+        $this->closing = true;
         $this->clearHeartbeatTimer();
+        if (Coroutine::getCid() < 0) {
+            // Outside a coroutine there is no safe way to await AMQP close-ok or a worker.
+            // Fall back to immediate cancellation, matching destructor semantics.
+            $this->closeTransport();
+            $this->operations?->close();
+            if (!$this->workerRunning) {
+                $this->workerBusy = false; $this->workerCid = null; $this->operations = null; $this->closing = false;
+            }
+            return;
+        }
+        // An operation blocked in recv cannot consume a queued close command. Closing the
+        // transport is the cancellation signal; the worker remains the only frame processor.
+        if ($this->workerBusy && Coroutine::getCid() !== $this->workerCid) $this->closeTransport();
         try {
-            $this->execute(function (): void {
+            $this->executeOperation(function (): void {
                 if ($this->isConnected()) {
                     try { $args = (new Writer())->short(200)->shortstr('Goodbye')->short(0)->short(0)->bytes(); $this->send(Frame::method(0, 10, 50, $args)); $this->readMethod(0); } catch (\Throwable) {}
                 }
                 $this->closeTransport();
             });
-        } finally { $this->stopWorker(); }
+        } catch (\Throwable) {
+            // close() is best-effort and idempotent. Queue/read timeouts still fall through
+            // to stopWorker(), which closes the transport and wakes blocked I/O.
+        } finally {
+            $this->stopWorker();
+            // A forced stop can return before an arbitrary user operation exits. Keep the
+            // gate closed until the worker's cleanup block runs in that case.
+            $this->closing = $this->workerRunning;
+        }
     }
     private function validateFrameForChannel(Frame $frame, int $channel): Frame
     {
@@ -259,33 +299,40 @@ final class Connection
             while (true) {
                 $command = $queue->pop();
                 if (!is_array($command)) break;
+                $reply = $command['reply'] ?? null;
+                $state = $command['state'] ?? null;
                 if (($command['stop'] ?? false) === true) {
-                    $command['reply']->push(['value'=>null]);
+                    if ($reply instanceof CoroutineChannel) $reply->push(['value'=>null]);
                     break;
                 }
-                if (($command['state']->cancelled ?? false) === true) {
-                    unset($command);
+                if (is_object($state) && ($state->cancelled ?? false) === true) {
+                    unset($command, $reply, $state);
                     continue;
                 }
                 $self = $weak->get();
                 if (!$self instanceof self) {
-                    $command['reply']?->push(['value'=>new \RuntimeException('AMQP connection was destroyed.')]);
+                    if ($reply instanceof CoroutineChannel) $reply->push(['value'=>new \RuntimeException('AMQP connection was destroyed.')]);
                     break;
                 }
                 $self->workerCid = Coroutine::getCid();
+                if (is_object($state)) $state->started = true;
+                $self->workerBusy = true;
                 try { $value = ($command['operation'])(); }
                 catch (\Throwable $error) { $value = $error; }
-                if (($command['state']->cancelled ?? false) === true) $self->closeTransport();
-                $command['reply']?->push(['value'=>$value]);
+                finally { $self->workerBusy = false; }
+                if (is_object($state) && ($state->cancelled ?? false) === true) $self->closeTransport();
+                if ($reply instanceof CoroutineChannel) $reply->push(['value'=>$value]);
                 // Do not retain an operation closure capturing the connection while waiting for the next command.
-                unset($command, $value, $self);
+                unset($command, $value, $self, $reply, $state);
             }
             $queue->close();
             $self = $weak->get();
             if ($self instanceof self && $self->operations === $queue) {
                 $self->workerRunning = false;
+                $self->workerBusy = false;
                 $self->workerCid = null;
                 $self->operations = null;
+                $self->closing = false;
             }
         });
         if ($workerCid === false) {
@@ -300,7 +347,9 @@ final class Connection
     {
         if (!$this->workerRunning || !$this->operations) return;
         if (Coroutine::getCid() === $this->workerCid) {
-            $this->workerRunning = false;
+            $queue = $this->operations;
+            $this->workerRunning = false; $this->workerBusy = false; $this->workerCid = null; $this->operations = null;
+            $queue->close();
             return;
         }
         $reply = new CoroutineChannel(1);
@@ -309,7 +358,7 @@ final class Connection
         $stopped = $queued ? $reply->pop($this->config->writeTimeout) : false;
         $reply->close();
         if (is_array($stopped)) {
-            $this->workerRunning = false; $this->workerCid = null; $this->operations = null;
+            $this->workerRunning = false; $this->workerBusy = false; $this->workerCid = null; $this->operations = null;
             return;
         }
         // Keep workerRunning=true until the worker actually exits, preventing a second worker
@@ -326,7 +375,11 @@ final class Connection
             $self = $weak->get();
             if (!$self instanceof self || !$self->workerRunning || !$self->operations) return;
             // The timer only submits work. The socket remains owned by the I/O worker.
-            $self->operations->push(['operation'=>fn () => $self->sendHeartbeatIfDue(), 'reply'=>null], 0.001);
+            $self->operations->push([
+                'operation'=>static function () use ($weak): void { $weak->get()?->sendHeartbeatIfDue(); },
+                'reply'=>null,
+                'state'=>null,
+            ], 0.001);
         });
         if ($timerId === false) throw new \RuntimeException('Unable to create AMQP heartbeat timer.');
         $this->heartbeatTimerId = $timerId;
