@@ -22,6 +22,7 @@ final class BasicProperties
     {
         $unknown = array_diff_key($properties, self::TYPES);
         if ($unknown !== []) throw new \InvalidArgumentException('Unknown basic property: ' . array_key_first($unknown));
+        self::validate($properties);
         $flags = 0; $writer = new Writer();
         foreach (self::TYPES as $name => [$bit]) if (($properties[$name] ?? null) !== null) $flags |= 1 << $bit;
         foreach (self::TYPES as $name => [, $type]) {
@@ -33,6 +34,23 @@ final class BasicProperties
             };
         }
         return pack('n', $flags) . $writer->bytes();
+    }
+
+    /** @param array<string, mixed> $properties */
+    private static function validate(array $properties): void
+    {
+        foreach (['content_type','content_encoding','correlation_id','reply_to','expiration','message_id','type','user_id','app_id','cluster_id'] as $name) {
+            if (isset($properties[$name]) && !is_string($properties[$name])) throw new \InvalidArgumentException("Basic property {$name} must be a string.");
+        }
+        if (isset($properties['headers']) && !is_array($properties['headers'])) throw new \InvalidArgumentException('Basic property headers must be an array.');
+        foreach (['delivery_mode','priority'] as $name) {
+            if (isset($properties[$name]) && (!is_int($properties[$name]) || $properties[$name] < 0 || $properties[$name] > 255)) {
+                throw new \InvalidArgumentException("Basic property {$name} must be an integer between 0 and 255.");
+            }
+        }
+        if (isset($properties['timestamp']) && (!is_int($properties['timestamp']) || $properties['timestamp'] < 0)) {
+            throw new \InvalidArgumentException('Basic property timestamp must be a non-negative integer.');
+        }
     }
 
     /** @return array<string, mixed> */

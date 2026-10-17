@@ -11,6 +11,7 @@ use EasySwoole\AMQP\Wire\ByteArray;
 use EasySwoole\AMQP\Wire\Decimal;
 use EasySwoole\AMQP\Wire\Reader;
 use EasySwoole\AMQP\Wire\Writer;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class WireTest extends TestCase
@@ -107,5 +108,46 @@ final class WireTest extends TestCase
     {
         $this->expectException(ProtocolException::class);
         Frame::read(fn (int $length): string => substr("\x01\x00", 0, $length));
+    }
+    public function testFrameRejectsUnknownType(): void
+    {
+        $encoded = pack('CnN', 99, 0, 0) . chr(Frame::END); $offset = 0;
+        $this->expectException(ProtocolException::class);
+        Frame::read(function (int $length) use (&$offset, $encoded): string {
+            $part = substr($encoded, $offset, $length); $offset += $length; return $part;
+        });
+    }
+    #[DataProvider('invalidHeartbeatFrames')]
+    public function testFrameRejectsInvalidHeartbeat(int $channel, string $payload): void
+    {
+        $encoded = pack('CnN', Frame::HEARTBEAT, $channel, strlen($payload)) . $payload . chr(Frame::END); $offset = 0;
+        $this->expectException(ProtocolException::class);
+        Frame::read(function (int $length) use (&$offset, $encoded): string {
+            $part = substr($encoded, $offset, $length); $offset += $length; return $part;
+        });
+    }
+    public static function invalidHeartbeatFrames(): iterable
+    {
+        yield 'nonzero channel' => [1, ''];
+        yield 'nonempty payload' => [0, 'x'];
+    }
+    public function testFrameRejectsOutOfRangeOutgoingIdentifiers(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Frame::method(65536, 60, 40);
+    }
+    #[DataProvider('invalidBasicProperties')]
+    public function testBasicPropertiesRejectInvalidTypes(array $properties): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        BasicProperties::encode($properties);
+    }
+    public static function invalidBasicProperties(): iterable
+    {
+        yield 'string' => [['content_type'=>123]];
+        yield 'headers' => [['headers'=>'not-a-table']];
+        yield 'octet range' => [['priority'=>256]];
+        yield 'octet type' => [['delivery_mode'=>'2']];
+        yield 'negative timestamp' => [['timestamp'=>-1]];
     }
 }

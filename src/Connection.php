@@ -78,7 +78,9 @@ final class Connection
             [$class, $method, $tune] = $this->readMethod(0);
             if ($class !== Protocol::CONNECTION || $method !== Protocol::CONNECTION_TUNE) throw new ProtocolException('Expected connection.tune.');
             $this->channelMax = self::negotiate($this->config->channelMax, $tune->short());
-            $this->frameMax = self::negotiate($this->config->frameMax, $tune->long());
+            $serverFrameMax = $tune->long();
+            if ($serverFrameMax !== 0 && $serverFrameMax < 4096) throw new ProtocolException('Server proposed an invalid frame-max below 4096.');
+            $this->frameMax = self::negotiate($this->config->frameMax, $serverFrameMax);
             $serverHeartbeat = $tune->short();
             // A client value of zero explicitly disables heartbeats, matching php-amqplib compatibility semantics.
             $this->heartbeat = $this->config->heartbeat === 0 ? 0 : self::negotiate($this->config->heartbeat, $serverHeartbeat);

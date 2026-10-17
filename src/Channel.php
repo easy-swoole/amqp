@@ -110,7 +110,7 @@ final class Channel
     }
     public function qos(int $prefetchCount, int $prefetchSize = 0, bool $global = false): void
     {
-        if ($prefetchCount < 0 || $prefetchCount > 65535 || $prefetchSize < 0) throw new \InvalidArgumentException('Invalid QoS values.');
+        if ($prefetchCount < 0 || $prefetchCount > 65535 || $prefetchSize < 0 || $prefetchSize > 0xffffffff) throw new \InvalidArgumentException('Invalid QoS values.');
         $this->operation(fn () => $this->rpc(60, 10, (new Writer())->long($prefetchSize)->short($prefetchCount)->bit($global)->bytes(), 60, 11));
     }
     /** @param array<string, mixed> $properties */
@@ -277,6 +277,7 @@ final class Channel
     public function nack(int $deliveryTag, bool $multiple = false, bool $requeue = true): void { $this->sendAck(120, $deliveryTag, $multiple, $requeue); }
     public function reject(int $deliveryTag, bool $requeue = true): void
     {
+        if ($deliveryTag <= 0) throw new \InvalidArgumentException('Reject delivery-tag must be positive.');
         $this->operation(function () use ($deliveryTag, $requeue): void {
             $this->connection->send(Frame::method($this->id, 60, 90, (new Writer())->longlong($deliveryTag)->bit($requeue)->bytes()));
             $this->markCallbackSettled($deliveryTag, false);
@@ -315,6 +316,7 @@ final class Channel
     }
     private function sendAck(int $method, int $tag, bool $multiple, ?bool $requeue): void
     {
+        if ($tag < 0 || ($tag === 0 && !$multiple)) throw new \InvalidArgumentException('Delivery-tag must be positive, or zero with multiple=true.');
         $this->operation(function () use ($method, $tag, $multiple, $requeue): void {
             $writer = (new Writer())->longlong($tag)->bit($multiple); if ($requeue !== null) $writer->bit($requeue);
             $this->connection->send(Frame::method($this->id, 60, $method, $writer->bytes()));

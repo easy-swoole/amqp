@@ -57,6 +57,21 @@ final class ClientTest extends TestCase
         );
         self::assertSame([[40,30],[40,40],[50,50],[50,30],[60,110],[60,100]], array_slice($methods, -6));
     }
+    public function testQosRejectsValuesThatWouldOverflowWireFields(): void
+    {
+        $channel = (new AMQP(new Config(), new MemoryTransport(ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()))))->channel();
+        $this->expectException(\InvalidArgumentException::class);
+        $channel->qos(1, 0x100000000);
+    }
+    public function testHandshakeRejectsServerFrameMaxBelowProtocolMinimum(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake(frameMax: 1));
+        $client = new AMQP(new Config(), $transport);
+        try { $client->connect(); self::fail('Expected invalid server frame-max.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('below 4096', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
+    }
     public function testPublishFramesBodyAndProperties(): void
     {
         $transport = new MemoryTransport(ServerFrames::handshake(4096) . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
@@ -76,6 +91,18 @@ final class ClientTest extends TestCase
         $bodyFrames = array_values(array_filter(self::writtenFrames($transport->written), fn (Frame $frame) => $frame->type === Frame::BODY));
         self::assertSame([4088, 4088, 824], array_map(fn (Frame $frame) => strlen($frame->payload), $bodyFrames));
     }
+    public function testOversizedOutboundMethodFrameAbortsConnectionBeforeWrite(): void
+    {
+        $transport = new MemoryTransport(ServerFrames::handshake(4096)
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()));
+        $client = new AMQP(new Config(frameMax: 4096), $transport);
+        $channel = $client->channel();
+        $writtenBefore = strlen($transport->written);
+        try { $channel->exchangeDeclare('events', arguments: ['large'=>str_repeat('x', 5000)]); self::fail('Expected frame-max rejection.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('frame-max', $error->getMessage()); }
+        self::assertSame($writtenBefore, strlen($transport->written));
+        self::assertFalse($client->isConnected());
+    }
     public function testEmptyGetReturnsNull(): void
     {
         $incoming = ServerFrames::handshake()
@@ -93,6 +120,21 @@ final class ClientTest extends TestCase
         $transport = new MemoryTransport($incoming); $channel = (new AMQP(new Config(), $transport))->channel(); $message = $channel->get('jobs');
         self::assertNotNull($message); self::assertSame('test', $message->body); self::assertSame(42, $message->deliveryTag); self::assertSame('text/plain', $message->properties['content_type']);
         $channel->ack($message->deliveryTag); $frames = self::writtenFrames($transport->written); self::assertSame([60,80], array_slice(end($frames)->methodParts(), 0, 2));
+    }
+    public function testAcknowledgementMethodsRejectInvalidDeliveryTags(): void
+    {
+        $channel = (new AMQP(new Config(), new MemoryTransport(ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes()))))->channel();
+        foreach ([
+            static fn () => $channel->ack(0),
+            static fn () => $channel->nack(-1, true),
+            static fn () => $channel->reject(0),
+        ] as $operation) {
+            try { $operation(); self::fail('Expected invalid delivery-tag.'); }
+            catch (\InvalidArgumentException) {}
+        }
+        $channel->ack(0, true);
+        self::assertTrue(true);
     }
     public function testOversizedInboundMessageAbortsConnection(): void
     {
@@ -498,6 +540,19 @@ final class ClientTest extends TestCase
         $channel->subscribe('jobs', static fn (): null => null, 'subscription');
         $this->expectException(\LogicException::class);
         $channel->consume('jobs', static fn (): null => null, 'blocking');
+    }
+    public function testDuplicateConsumerTagFromBrokerAbortsConnection(): void
+    {
+        $incoming = ServerFrames::handshake()
+            . ServerFrames::method(1, 20, 11, (new Writer())->longstr('')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('duplicate')->bytes())
+            . ServerFrames::method(1, 60, 21, (new Writer())->shortstr('duplicate')->bytes());
+        $client = new AMQP(new Config(), new MemoryTransport($incoming));
+        $channel = $client->channel();
+        $channel->subscribe('jobs', static fn (): null => null, 'first');
+        try { $channel->subscribe('jobs', static fn (): null => null, 'second'); self::fail('Expected duplicate consumer tag.'); }
+        catch (ProtocolException $error) { self::assertStringContainsString('Duplicate consumer tag', $error->getMessage()); }
+        self::assertFalse($client->isConnected());
     }
     public function testOnlyOneSubscriptionWaitLoopCanRunPerChannel(): void
     {
